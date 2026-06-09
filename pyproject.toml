@@ -21,4 +21,4 @@ dependencies = [
 Homepage = "https://github.com/danielraffel/pulp"
 
 [tool.setuptools]
-packages = ["pulp_importer_substrate"]
+packages = ["pulp_importer_substrate", "pulp_importer_substrate.emit"]

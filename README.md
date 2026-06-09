@@ -36,6 +36,45 @@ to a partial extraction instead of aborting. On a clean parse (every cursor kind
 resolves) it is identical to a plain pre-order walk — which is why adopting it in
 both importers is byte-identical against their existing goldens.
 
+## The shared EMIT core (`pulp_importer_substrate.emit`)
+
+The same de-duplication argument applies to the EMIT step. EMIT consumes a
+**vendor-neutral** ProjectIR (already-resolved fields like `dsp.mappings`,
+`parameters[].pulp_range` / `source_curve` / `proposed_pulp_id`, the state/DSP
+classifications) and proposes a Pulp migration scaffold. Because the IR is
+framework-neutral, the scaffold generators are framework-neutral too — so they
+live here once and both importers share them.
+
+`pulp_importer_substrate.emit` exposes:
+
+| Name | Purpose |
+|------|---------|
+| `produce(ir, …)` | pure: ProjectIR → `{files: [FileSpec], migration_status, formats, deferred_formats, unresolved, …}`. The one place the scaffold is shaped. |
+| `emit(ir, out_dir, …)` | thin shell over `produce()` that writes the FileSpecs to disk (content → write, `copy_from` → verbatim copy). |
+| `FileSpec` | one proposed file: either inline `content` (generated/stub) or a `copy_from` verbatim portable-core copy; `as_manifest_entry()` serialises it for the SPI EmissionManifest. |
+| `make_framework_free_predicate(tokens)` | builds the "is this header framework-free enough to copy verbatim?" predicate from the importer's source-tell tokens (DATA). |
+
+It names **no vendor**. The framework-specific touch-points are injected as
+DATA / callables by each importer:
+
+- `render_report(ir) -> str` — the importer's own IMPORT_REPORT.md renderer
+  (column sets and provenance prose differ per framework). The core appends an
+  EMIT verdict block on top.
+- `framework_free_predicate(text) -> bool` — built from the framework's source
+  tells (its `fw::` namespace qualifier + include stems) via
+  `make_framework_free_predicate`.
+- `boundary_name_markers: [str]` — filename substrings of framework
+  boundary/metadata headers that must never be copied as a DSP core
+  (e.g. an importer's `PluginProcessor`/`PluginEditor`, or a metadata
+  `config.h`).
+- `id_label` / `tool_label` — cosmetic prose labels in the generated comments.
+- `emit_tool` — the migration_status emit-tool identity string.
+
+Each importer keeps a **thin shim** that injects its DATA and exposes the SPI
+`emit` verb / CLI; the generator bodies are not duplicated. The `dsp_map.json`
+itself stays per-importer because the *extractor* resolves it into the IR — emit
+only ever reads the already-resolved `dsp.mappings`.
+
 ## What's deliberately NOT shared (stays per-importer)
 
 These diverge between importers today; forcing them into the substrate would
@@ -84,12 +123,17 @@ shape, and pin the substrate version per SPI version in each importer.
 ## Tests
 
 ```bash
-python3 tests/test_substrate.py
+python3 tests/test_substrate.py   # extraction core (tokens / ids / mappings + libclang smoke)
+python3 tests/test_emit.py        # emit core (scaffold generators + injection points)
 ```
 
 The token helpers are pure, so they're unit-tested without libclang (including a
 trailing-dot-float case for `numeric_seq` — the regression can now only live in
 one place). A libclang-dependent smoke runs only if the binding is importable.
+The emit core is pure too — `tests/test_emit.py` drives it with a synthetic
+vendor-neutral IR (no libclang, no framework) and locks the scaffold file set,
+shaped-vs-linear range emission, and the injected report/predicate/label
+touch-points.
 
 ## Status
 
