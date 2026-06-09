@@ -253,6 +253,106 @@ class PortableCoreTest(unittest.TestCase):
             self.assertEqual(info["formats"], ["CLAP"])
 
 
+class WebViewUITest(unittest.TestCase):
+    """When the IR's vendor-neutral `ui.kind` is `"webview"`, EMIT produces a
+    Pulp webview-ui scaffold (WebViewPanel-hosting create_view + native
+    param-by-string-key bridge shim + placeholder ui/ assets), NOT the native
+    Canvas2D/custom-paint path. Non-webview UIs keep the existing path. The core
+    branches on the `ui.kind` DATA alone and names no framework."""
+
+    def _webview_ir(self, *, html_entry=None, relays=None):
+        ir = _ir()
+        ir["ui"] = {
+            "kind": "webview", "model": "webview", "confidence": 0.8,
+            "asset_hints": {
+                "html_entry": html_entry,
+                "param_relays": relays or [],
+                "bridge_calls": ["withNativeIntegrationEnabled"],
+            },
+        }
+        return ir
+
+    def _files(self, ir):
+        return {f.path: f for f in produce(ir)["files"]}
+
+    def test_native_path_unchanged_without_webview_kind(self):
+        # The default IR has no ui block -> native path: no create_view, no ui/.
+        files = self._files(_ir())
+        self.assertNotIn("ui/index.html", files)
+        hpp = files["src/PluginProcessor.hpp"].content
+        cpp = files["src/PluginProcessor.cpp"].content
+        self.assertNotIn("create_view", hpp)
+        self.assertNotIn("WebViewPanel", cpp)
+
+    def test_explicit_native_kind_stays_native(self):
+        ir = _ir()
+        ir["ui"] = {"kind": "native", "model": "custom-paint"}
+        files = self._files(ir)
+        self.assertNotIn("ui/index.html", files)
+        self.assertNotIn("create_view", files["src/PluginProcessor.hpp"].content)
+
+    def test_webview_emits_scaffold_not_canvas2d(self):
+        files = self._files(self._webview_ir())
+        # Placeholder web asset shipped (generated, not a copied user file).
+        self.assertIn("ui/index.html", files)
+        self.assertEqual(files["ui/index.html"].provenance, "generated")
+        self.assertEqual(files["ui/index.html"].classification, "asset")
+        hpp = files["src/PluginProcessor.hpp"].content
+        cpp = files["src/PluginProcessor.cpp"].content
+        # Header declares the view lifecycle.
+        self.assertIn("std::unique_ptr<pulp::view::View> create_view() override;", hpp)
+        self.assertIn("pulp::format::ViewSize view_size() const override;", hpp)
+        self.assertIn("#include <pulp/view/web_view.hpp>", hpp)
+        # Source hosts a WebViewPanel via the directory resource fetcher.
+        self.assertIn("pulp::view::WebViewPanel::create(options)", cpp)
+        self.assertIn("make_webview_directory_resource_fetcher", cpp)
+        self.assertIn("class WebViewEditorRoot", cpp)
+        self.assertIn("attach_native_child_view", cpp)
+        # The asset-copy TODO is present and honest.
+        self.assertIn("TODO(import): copy your WebView assets (HTML/JS/CSS) into ui/",
+                      cpp)
+        self.assertIn("the importer cannot extract bundled binary resources", cpp)
+
+    def test_webview_native_param_bridge_shim_maps_by_key(self):
+        cpp = self._files(self._webview_ir())["src/PluginProcessor.cpp"].content
+        # The bridge maps the source param id string ("gain") to the stable enum.
+        self.assertIn("set_message_handler", cpp)
+        self.assertIn('if (key == "gain") { out = kParam_gain; return true; }', cpp)
+        self.assertIn('if (msg.type == "param")', cpp)
+        # A TODO for bespoke (non-param) message handlers.
+        self.assertIn("bespoke message", cpp)
+
+    def test_webview_uses_literal_html_entry_when_present(self):
+        cpp = self._files(self._webview_ir(html_entry="editor.html"))[
+            "src/PluginProcessor.cpp"].content
+        self.assertIn('navigate("pulp://app/editor.html")', cpp)
+        self.assertIn("INSPECT found a literal HTML entry reference", cpp)
+
+    def test_webview_defaults_entry_with_todo_when_unresolved(self):
+        cpp = self._files(self._webview_ir(html_entry=None))[
+            "src/PluginProcessor.cpp"].content
+        self.assertIn('navigate("pulp://app/index.html")', cpp)
+        self.assertIn("could not statically resolve the HTML entry", cpp)
+
+    def test_webview_strips_directory_from_entry_hint(self):
+        # An entry hint with a path -> only the filename is used (ui/ is root).
+        cpp = self._files(self._webview_ir(html_entry="web/public/app.html"))[
+            "src/PluginProcessor.cpp"].content
+        self.assertIn('navigate("pulp://app/app.html")', cpp)
+
+    def test_webview_migration_status_records_ui(self):
+        status = produce(self._webview_ir())["migration_status"]
+        self.assertEqual(status["ui_kind"], "webview")
+        self.assertEqual(status["verdict"]["ui_parity"], "partial")
+        self.assertTrue(any("WebView UI" in t for t in status["todos"]))
+
+    def test_webview_index_html_exercises_bridge(self):
+        html = self._files(self._webview_ir())["ui/index.html"].content
+        self.assertIn("window.pulp", html)
+        self.assertIn("placeholder", html.lower())
+        self.assertIn("<!doctype html>", html)
+
+
 class FileSpecTest(unittest.TestCase):
     def test_generated_entry_inlines_content(self):
         e = FileSpec("a.cpp", content="x", provenance="generated",

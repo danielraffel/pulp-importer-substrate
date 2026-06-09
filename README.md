@@ -75,6 +75,27 @@ Each importer keeps a **thin shim** that injects its DATA and exposes the SPI
 itself stays per-importer because the *extractor* resolves it into the IR — emit
 only ever reads the already-resolved `dsp.mappings`.
 
+### UI branch (`ui.kind` DATA)
+
+The emit core branches the editor scaffold on the IR's vendor-neutral
+`ui.kind`:
+
+- `ui.kind == "webview"` → a **Pulp webview-ui scaffold**: a `create_view()`
+  hosting a `pulp::view::WebViewPanel` that serves an embedded `ui/` asset
+  directory (via `make_webview_directory_resource_fetcher`), a placeholder
+  `ui/index.html`, a `// TODO(import): copy your WebView assets …` note (bundled
+  binary web resources can't be extracted), and a **native param-bridge shim**
+  mapping the source's JS↔native param bridge onto Pulp's WebView bridge
+  **param-by-string-key** (the preserved source parameter id strings). A literal
+  HTML entry filename from `ui.asset_hints.html_entry` is used when the extractor
+  resolved one; otherwise it defaults to `index.html` with a TODO.
+- anything else (`"native"` / absent) → the existing native scaffold path,
+  unchanged.
+
+The framework-specific webview markers (JUCE's `WebBrowserComponent`, iPlug2's
+`IWebView`/`IGraphicsWebView`) live **only in each importer's `classify_ui`** —
+the core branches on the `kind` DATA and names no framework.
+
 ## What's deliberately NOT shared (stays per-importer)
 
 These diverge between importers today; forcing them into the substrate would

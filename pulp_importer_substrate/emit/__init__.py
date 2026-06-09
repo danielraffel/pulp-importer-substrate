@@ -408,11 +408,27 @@ def _emit_descriptor(ir: dict, class_name: str) -> list[str]:
     return L
 
 
+# --- UI classification ------------------------------------------------------
+
+def _is_webview_ui(ir: dict) -> bool:
+    """True when the IR's vendor-neutral UI classification is a WebView.
+
+    The importers' INSPECT step sets `ui.kind` to `"webview"` when the source
+    plugin's editor is a WebView (framework-specific markers — JUCE's
+    WebBrowserComponent, iPlug2's IWebView/IGraphicsWebView — live only in the
+    per-importer extractors). The shared emit core branches on this DATA alone
+    and names no framework. Anything else (native / custom-paint / stock /
+    none / unknown) takes the existing native scaffold path unchanged.
+    """
+    return (ir.get("ui", {}) or {}).get("kind") == "webview"
+
+
 # --- file generators --------------------------------------------------------
 
 def _gen_header(ir: dict, class_name: str, factory_name: str, namespace: str,
                 params: list[tuple[str, int, str]], header_name: str,
                 id_label: str, tool_label: str) -> str:
+    webview = _is_webview_ui(ir)
     L: list[str] = []
     L.append("#pragma once")
     L.append("")
@@ -422,6 +438,12 @@ def _gen_header(ir: dict, class_name: str, factory_name: str, namespace: str,
     L.append("// `TODO(import)` to find everything that still needs migration.")
     L.append("")
     L.append("#include <pulp/format/processor.hpp>")
+    if webview:
+        # WebView editor scaffold needs the view + WebView host headers.
+        L.append("#include <pulp/view/plugin_view_host.hpp>")
+        L.append("#include <pulp/view/view.hpp>")
+        L.append("#include <pulp/view/web_view.hpp>")
+        L.append("#include <memory>")
     L.append("#include <algorithm>")
     L.append("#include <cstdint>")
     L.append("#include <string>")
@@ -451,6 +473,16 @@ def _gen_header(ir: dict, class_name: str, factory_name: str, namespace: str,
     L.append("")
     L.append("    std::vector<uint8_t> serialize_plugin_state() const override;")
     L.append("    bool deserialize_plugin_state(std::span<const uint8_t> data) override;")
+    if webview:
+        L.append("")
+        L.append("    // WebView editor: the source plugin's UI was a WebView, so the")
+        L.append("    // imported editor hosts a Pulp WebViewPanel pointing at the")
+        L.append("    // embedded `ui/` asset directory. See PluginProcessor.cpp.")
+        L.append("    pulp::format::ViewSize view_size() const override;")
+        L.append("    std::unique_ptr<pulp::view::View> create_view() override;")
+        L.append("    void on_view_opened(pulp::view::View& root) override;")
+        L.append("    void on_view_resized(pulp::view::View& root, uint32_t w, uint32_t h) override;")
+        L.append("    void on_view_closed(pulp::view::View& root) override;")
     L.append("};")
     L.append("")
     L.append(f"std::unique_ptr<pulp::format::Processor> create_{factory_name}();")
@@ -512,6 +544,326 @@ def _emit_state_skeleton(class_name: str, opaque: bool) -> list[str]:
     return L
 
 
+# --- WebView editor emission ------------------------------------------------
+
+# The default web origin root and entry filename for the embedded WebView. The
+# importer cannot extract bundled binary web resources, so the scaffold ships a
+# placeholder `ui/index.html` and serves the `ui/` directory through Pulp's
+# directory-backed WebView resource fetcher. The porter replaces the placeholder
+# with the real HTML/JS/CSS payload.
+_WEBVIEW_UI_DIR = "ui"
+_WEBVIEW_DEFAULT_ENTRY = "index.html"
+
+
+def _webview_entry(ir: dict) -> str:
+    """The HTML entry filename for the embedded WebView.
+
+    Honesty rule (plan §16.3): use a literal filename ONLY when the INSPECT step
+    statically resolved one from a string literal in the source
+    (`ui.asset_hints.html_entry`). Otherwise default to `index.html` and leave a
+    TODO — never guess a path the source did not contain.
+    """
+    hint = (((ir.get("ui", {}) or {}).get("asset_hints") or {}).get("html_entry"))
+    if isinstance(hint, str) and hint.strip():
+        # Strip any directory portion — the scaffold serves the ui/ dir as root.
+        return hint.strip().replace("\\", "/").split("/")[-1]
+    return _WEBVIEW_DEFAULT_ENTRY
+
+
+def _emit_webview_view(ir: dict, class_name: str,
+                       params: list[tuple[str, int, str]]) -> list[str]:
+    """The WebView editor scaffold: a `create_view()` that hosts a Pulp
+    WebViewPanel pointing at the embedded `ui/` asset dir, plus a native
+    JS<->param bridge shim that maps the source's bridge onto Pulp's WebView
+    bridge (param-by-string-key).
+
+    Mirrors the real Pulp pattern in `examples/webview-plugin/` (PluginViewHost +
+    attach_native_child_view + WebViewPanel). The bound page assets are NOT
+    extractable statically, so the scaffold ships a placeholder ui/ dir and a
+    loud `// TODO(import)` to copy the real payload in.
+    """
+    ui = ir.get("ui", {}) or {}
+    hints = ui.get("asset_hints") or {}
+    entry = _webview_entry(ir)
+    has_entry_hint = bool(isinstance(hints.get("html_entry"), str)
+                          and hints.get("html_entry"))
+
+    L: list[str] = []
+    L.append("// ---- WebView editor scaffold (UI kind: webview) "
+             "------------------------")
+    L.append("// The source plugin's editor was a WebView. This scaffold hosts a Pulp")
+    L.append("// WebViewPanel inside the plugin editor subtree, serving the embedded")
+    L.append(f"// `{_WEBVIEW_UI_DIR}/` directory as the web origin (same pattern as the")
+    L.append("// Pulp `examples/webview-plugin/` reference).")
+    L.append("//")
+    L.append("// TODO(import): copy your WebView assets (HTML/JS/CSS) into "
+             f"{_WEBVIEW_UI_DIR}/ —")
+    L.append("//   the importer cannot extract bundled binary resources. A placeholder")
+    L.append(f"//   {_WEBVIEW_UI_DIR}/{_WEBVIEW_DEFAULT_ENTRY} ships so the scaffold builds and "
+             "renders something.")
+    if has_entry_hint:
+        L.append(f"// INSPECT found a literal HTML entry reference: \"{_cpp_str(entry)}\" "
+                 "— wire your")
+        L.append("//   copied assets so that file is the entry point.")
+    else:
+        L.append("// TODO(import): INSPECT could not statically resolve the HTML entry "
+                 "filename")
+        L.append(f"//   (no string literal found); defaulting to {_WEBVIEW_DEFAULT_ENTRY}. "
+                 "Confirm + adjust.")
+    L.append("")
+
+    L.append("class WebViewEditorPane final : public pulp::view::View {")
+    L.append("public:")
+    L.append("    explicit WebViewEditorPane(pulp::state::StateStore& store) "
+             ": store_(store) {")
+    L.append("        pulp::view::WebViewOptions options;")
+    L.append("        options.transparent_background = true;")
+    L.append("        // Serve the embedded ui/ directory as the web origin. In a "
+             "packaged")
+    L.append("        // build, point this at the installed resource directory.")
+    L.append(f'        options.custom_scheme_uri = "pulp://app/";')
+    L.append("        options.fetch_resource =")
+    L.append("            pulp::view::make_webview_directory_resource_fetcher(")
+    L.append(f'                ui_root(), "{_cpp_str(entry)}");')
+    L.append("        panel_ = pulp::view::WebViewPanel::create(options);")
+    L.append("        if (!panel_) return;  // backend unavailable; native fallback")
+    L.append("        install_bridge();")
+    L.append("        panel_->set_ready_handler([this] {")
+    L.append(f'            if (panel_) panel_->navigate("pulp://app/{_cpp_str(entry)}");')
+    L.append("            push_all_params();")
+    L.append("        });")
+    L.append("    }")
+    L.append("")
+    L.append("    ~WebViewEditorPane() override { detach_if_needed(); }")
+    L.append("")
+    L.extend(_emit_webview_bridge(params))
+    L.append("")
+    L.append("    void attach_if_needed() {")
+    L.append("        auto* host = plugin_view_host();")
+    L.append("        if (attached_ || !host || !panel_ || !panel_->native_handle()) "
+             "return;")
+    L.append("        const auto size = host->get_size();")
+    L.append("        attached_ = host->attach_native_child_view(")
+    L.append("            panel_->native_handle(), 0.0f, 0.0f,")
+    L.append("            static_cast<float>(size.width), "
+             "static_cast<float>(size.height));")
+    L.append("        if (attached_) sync_to_host();")
+    L.append("    }")
+    L.append("")
+    L.append("    void sync_to_host() {")
+    L.append("        auto* host = plugin_view_host();")
+    L.append("        if (!attached_ || !host || !panel_ || !panel_->native_handle()) "
+             "return;")
+    L.append("        const auto size = host->get_size();")
+    L.append("        host->set_native_child_view_bounds(")
+    L.append("            panel_->native_handle(), 0.0f, 0.0f,")
+    L.append("            static_cast<float>(size.width), "
+             "static_cast<float>(size.height));")
+    L.append("    }")
+    L.append("")
+    L.append("    void detach_if_needed() {")
+    L.append("        auto* host = plugin_view_host();")
+    L.append("        if (!attached_ || !host || !panel_ || !panel_->native_handle()) {")
+    L.append("            attached_ = false;")
+    L.append("            return;")
+    L.append("        }")
+    L.append("        host->detach_native_child_view(panel_->native_handle());")
+    L.append("        attached_ = false;")
+    L.append("    }")
+    L.append("")
+    L.append("private:")
+    L.append("    static std::filesystem::path ui_root() {")
+    L.append("        // TODO(import): resolve this to the installed ui/ resource dir for")
+    L.append(f"        //   packaged builds. During development it is the scaffold's "
+             f"{_WEBVIEW_UI_DIR}/.")
+    L.append(f'        return std::filesystem::path("{_WEBVIEW_UI_DIR}");')
+    L.append("    }")
+    L.append("")
+    L.append("    pulp::state::StateStore& store_;")
+    L.append("    std::unique_ptr<pulp::view::WebViewPanel> panel_;")
+    L.append("    bool attached_ = false;")
+    L.append("};")
+    L.append("")
+    L.append("class WebViewEditorRoot final : public pulp::view::View {")
+    L.append("public:")
+    L.append("    explicit WebViewEditorRoot(pulp::state::StateStore& store) {")
+    L.append("        auto pane = std::make_unique<WebViewEditorPane>(store);")
+    L.append("        pane_ = pane.get();")
+    L.append("        add_child(std::move(pane));")
+    L.append("    }")
+    L.append("    WebViewEditorPane& pane() { return *pane_; }")
+    L.append("    void on_resized() override {")
+    L.append("        if (pane_) pane_->set_bounds({0, 0, bounds().width, "
+             "bounds().height});")
+    L.append("    }")
+    L.append("private:")
+    L.append("    WebViewEditorPane* pane_ = nullptr;")
+    L.append("};")
+    L.append("// --------------------------------------------------------------"
+             "------------")
+    return L
+
+
+def _emit_webview_bridge(params: list[tuple[str, int, str]]) -> list[str]:
+    """The native JS<->param bridge shim: maps the source plugin's web param
+    bridge onto Pulp's WebView message bridge, param-by-string-key.
+
+    The contract mirrors Pulp's existing param-bridge: the page posts
+    `{type:"param", payload:{key, value}}` to set a parameter, and native pushes
+    `{type:"param", payload:{key, value}}` back when a value changes. The source
+    framework's bespoke relay/bridge handlers (JUCE WebSliderRelay, iPlug2
+    SendJSONFromDelegate, ...) are mapped onto this contract by the SAME string
+    key the parameter carries — that key is the source parameter id string the
+    IR preserved, so the JS side keeps using its original names.
+    """
+    L: list[str] = []
+    L.append("    // Native <-> JS parameter bridge (param-by-string-key). The page")
+    L.append("    // sets a parameter via window.pulp.postMessage(\"param\", "
+             "{key, value}),")
+    L.append("    // and native pushes value changes back the same way. The keys are the")
+    L.append("    // source parameter id strings the import preserved.")
+    L.append("    void install_bridge() {")
+    L.append("        if (!panel_) return;")
+    L.append("        panel_->set_message_handler(")
+    L.append("            [this](const pulp::view::WebViewMessage& msg) -> std::string {")
+    L.append('            if (msg.type == "param") {')
+    L.append("                // TODO(import): parse {key, value} from msg.payload_json and")
+    L.append("                //   route to the StateStore parameter with that key, e.g.:")
+    L.append("                //     store_.set_parameter(key_to_id(key), value);")
+    L.append("                return handle_param_message(msg.payload_json);")
+    L.append("            }")
+    L.append("            // TODO(import): the source plugin may have bespoke message")
+    L.append("            //   handlers (custom JS<->native calls beyond parameters).")
+    L.append("            //   Map each one onto a msg.type case here.")
+    L.append('            return R"({"ok":true})";')
+    L.append("        });")
+    L.append("    }")
+    L.append("")
+    L.append("    // Map a source parameter key string to its stable Pulp ParamID.")
+    L.append("    static bool key_to_id(const std::string& key, "
+             "pulp::state::ParamID& out) {")
+    if params:
+        L.append("        // Keys are the source parameter id strings preserved by the import.")
+        for enum, _pid, sid in params:
+            L.append(f'        if (key == "{_cpp_str(sid)}") {{ out = {enum}; return true; }}')
+    else:
+        L.append("        (void)key; (void)out;")
+        L.append("        // No statically-resolved parameters to map.")
+    L.append("        return false;  // unknown key — bespoke / unresolved")
+    L.append("    }")
+    L.append("")
+    L.append("    std::string handle_param_message(const std::string& payload_json) {")
+    L.append("        // TODO(import): decode payload_json (a {\"key\":..,\"value\":..}")
+    L.append("        //   object), look the key up with key_to_id(), and apply it via")
+    L.append("        //   store_.set_parameter(id, value). Returning ok keeps the bridge")
+    L.append("        //   responsive while the decode is wired up.")
+    L.append("        (void)payload_json;")
+    L.append('        return R"({"ok":true})";')
+    L.append("    }")
+    L.append("")
+    L.append("    // Push every current parameter value to the page on load, so the web")
+    L.append("    // UI initialises to the live plugin state.")
+    L.append("    void push_all_params() {")
+    L.append("        if (!panel_) return;")
+    if params:
+        for enum, _pid, sid in params:
+            L.append("        // TODO(import): post the live value for "
+                     f'"{_cpp_str(sid)}" to the page, e.g.:')
+            L.append("        //   post_param(\"" + _cpp_str(sid) + f'", store_.get_parameter({enum}));')
+    else:
+        L.append("        // No statically-resolved parameters to push.")
+    L.append("    }")
+    L.append("")
+    L.append("    void post_param(const std::string& key, float value) {")
+    L.append("        if (!panel_) return;")
+    L.append("        pulp::view::WebViewMessage m;")
+    L.append('        m.type = "param";')
+    L.append("        // TODO(import): serialize {key, value} as JSON for the payload.")
+    L.append("        (void)key; (void)value;")
+    L.append('        m.payload_json = "null";')
+    L.append("        panel_->post_message(m);")
+    L.append("    }")
+    return L
+
+
+def _emit_webview_view_hooks(class_name: str) -> list[str]:
+    """The Processor view-lifecycle hook bodies for the WebView editor."""
+    L: list[str] = []
+    L.append(f"pulp::format::ViewSize {class_name}::view_size() const {{")
+    L.append("    // TODO(import): match the source editor's natural / min / max size.")
+    L.append("    return {720, 440, 480, 320, 1280, 800};")
+    L.append("}")
+    L.append("")
+    L.append(f"std::unique_ptr<pulp::view::View> {class_name}::create_view() {{")
+    L.append("    return std::make_unique<WebViewEditorRoot>(state());")
+    L.append("}")
+    L.append("")
+    L.append(f"void {class_name}::on_view_opened(pulp::view::View& root) {{")
+    L.append("    static_cast<WebViewEditorRoot&>(root).pane().attach_if_needed();")
+    L.append("}")
+    L.append("")
+    L.append(f"void {class_name}::on_view_resized(pulp::view::View& root, "
+             "uint32_t, uint32_t) {")
+    L.append("    static_cast<WebViewEditorRoot&>(root).pane().sync_to_host();")
+    L.append("}")
+    L.append("")
+    L.append(f"void {class_name}::on_view_closed(pulp::view::View& root) {{")
+    L.append("    static_cast<WebViewEditorRoot&>(root).pane().detach_if_needed();")
+    L.append("}")
+    return L
+
+
+def _gen_webview_index_html(ir: dict) -> str:
+    """The placeholder ui/index.html the WebView serves until the real assets
+    are copied in. Self-contained, dark-themed, and exercises the bridge so the
+    porter can see whether native<->JS is wired before swapping in real assets."""
+    name = _cpp_str((ir.get("metadata", {}) or {}).get("name") or "Imported Plugin")
+    return (
+        "<!doctype html>\n"
+        "<html lang=\"en\">\n"
+        "  <head>\n"
+        "    <meta charset=\"utf-8\">\n"
+        "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "    <title>" + name + " — imported WebView UI (placeholder)</title>\n"
+        "    <style>\n"
+        "      :root { color-scheme: dark; font-family: system-ui, sans-serif; }\n"
+        "      body { margin: 0; min-height: 100vh; display: grid; "
+        "place-items: center;\n"
+        "             background: #0f172a; color: #e2e8f0; }\n"
+        "      .card { max-width: 480px; padding: 24px; border-radius: 16px;\n"
+        "              border: 1px solid #334155; background: #1e293b; }\n"
+        "      code { color: #7dd3fc; }\n"
+        "    </style>\n"
+        "  </head>\n"
+        "  <body>\n"
+        "    <main class=\"card\">\n"
+        "      <h1>" + name + "</h1>\n"
+        "      <p>This is a <strong>placeholder</strong> WebView UI emitted by the "
+        "Pulp importer.</p>\n"
+        "      <p>TODO(import): replace the files in <code>ui/</code> with your "
+        "original WebView assets (HTML/JS/CSS). The importer cannot extract "
+        "bundled binary resources.</p>\n"
+        "      <p id=\"status\">bridge: checking…</p>\n"
+        "    </main>\n"
+        "    <script>\n"
+        "      const status = document.getElementById('status');\n"
+        "      // Pulp installs window.pulp on the native host. The bridge maps\n"
+        "      // parameters by string key: post {type:'param', {key, value}} to set,\n"
+        "      // and listen for the same shape pushed from native.\n"
+        "      if (window.pulp) {\n"
+        "        status.textContent = 'bridge: available';\n"
+        "        window.pulp.on('param', (p) => {\n"
+        "          // TODO(import): update your UI for the changed parameter p.key.\n"
+        "        });\n"
+        "      } else {\n"
+        "        status.textContent = 'bridge: unavailable (browser preview)';\n"
+        "      }\n"
+        "    </script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+
+
 def _gen_source(ir: dict, class_name: str, factory_name: str, namespace: str,
                 params: list[tuple[str, int, str]], header_name: str,
                 copied_cores: list[str], id_label: str,
@@ -522,11 +874,27 @@ def _gen_source(ir: dict, class_name: str, factory_name: str, namespace: str,
     # map enum_name -> ir param dict by source id
     by_sid = {(p.get("source_id_string") or p.get("id")): p for p in ir_params}
 
+    webview = _is_webview_ui(ir)
+
     L: list[str] = []
     L.append(f'#include "{header_name}"')
+    if webview:
+        L.append("")
+        L.append("#include <filesystem>")
     L.append("")
     L.append(f"namespace {namespace} {{")
     L.append("")
+
+    # WebView editor classes (anonymous namespace) — only when the source UI was
+    # a WebView. The Processor's create_view()/lifecycle hook bodies below
+    # reference these.
+    if webview:
+        L.append("namespace {")
+        L.append("")
+        L.extend(_emit_webview_view(ir, class_name, params))
+        L.append("")
+        L.append("}  // namespace")
+        L.append("")
 
     # define_parameters
     L.append(f"void {class_name}::define_parameters("
@@ -585,6 +953,11 @@ def _gen_source(ir: dict, class_name: str, factory_name: str, namespace: str,
     # adapter cannot model for you.
     L.extend(_emit_state_skeleton(class_name, opaque))
     L.append("")
+
+    # WebView editor lifecycle hooks (only when the source UI was a WebView).
+    if webview:
+        L.extend(_emit_webview_view_hooks(class_name))
+        L.append("")
 
     # factory
     L.append(f"std::unique_ptr<pulp::format::Processor> create_{factory_name}() {{")
@@ -681,11 +1054,26 @@ def _gen_migration_status(ir: dict, copied_cores: list[str],
         todos.append("opaque-custom state: binary session compatibility with the "
                      "original plugin is NOT supported")
 
+    # UI
+    ui_kind = (ir.get("ui", {}) or {}).get("kind") or "native"
+    if ui_kind == "webview":
+        todos.append("WebView UI: copy your original WebView assets (HTML/JS/CSS) "
+                     "into ui/ — the importer cannot extract bundled binary "
+                     "resources. The emitted create_view() hosts a Pulp "
+                     "WebViewPanel + a native param-by-string-key bridge shim; "
+                     "wire up the payload decode and any bespoke message handlers.")
+
     audio_parity = "no"
     if dsp.get("classification") == "portable-core":
         audio_parity = "partial"  # core copied, wiring still TODO
     elif dsp.get("classification") in ("framework-bound-mappable", "framework-bound-midi"):
         audio_parity = "no"
+
+    # UI parity: for a webview import the editor *shell* (WebViewPanel host +
+    # bridge wiring) is scaffolded, but the actual web payload + bridge decode
+    # are TODOs, so it is "partial" — better than the native/custom-paint path
+    # ("no") which only emits a placeholder, but not a finished UI.
+    ui_parity = "partial" if ui_kind == "webview" else "no"
 
     return {
         "status": "unresolved",
@@ -693,10 +1081,11 @@ def _gen_migration_status(ir: dict, copied_cores: list[str],
         "source": ir.get("source", {}),
         "plugin": md.get("name"),
         "emit_tool": emit_tool,
+        "ui_kind": ui_kind,
         "verdict": {
             "builds": "yes",
             "audio_parity": audio_parity,
-            "ui_parity": "no",
+            "ui_parity": ui_parity,
             "session_compatibility": "no",
         },
         "dsp_classification": dsp.get("classification"),
@@ -954,6 +1343,18 @@ def produce(ir: dict, source_dir: Path | None = None,
                           classification="source",
                           content=_gen_clap_entry(factory_name, namespace,
                                                   header_name)))
+
+    # WebView UI scaffold: when the source editor was a WebView, the generated
+    # create_view() serves the `ui/` directory through a Pulp WebViewPanel. The
+    # bundled web payload can't be extracted statically, so ship a placeholder
+    # `ui/index.html` (a real, building page that proves the bridge) the porter
+    # replaces with the original HTML/JS/CSS. The placeholder is "generated", not
+    # a copied user file.
+    webview = _is_webview_ui(ir)
+    if webview:
+        files.append(FileSpec(f"{_WEBVIEW_UI_DIR}/{_WEBVIEW_DEFAULT_ENTRY}",
+                              provenance="generated", classification="asset",
+                              content=_gen_webview_index_html(ir)))
 
     # Formats: emit CLAP only — it is self-contained (no external SDK), always
     # links (we generate its entry point), and is dlopen-testable. The source's
