@@ -27,6 +27,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 from pulp_importer_substrate.emit import (  # noqa: E402
+    DEFAULT_CONFIDENCE_FLOOR,
     FileSpec,
     emit,
     make_framework_free_predicate,
@@ -104,6 +105,78 @@ class ProduceShapeTest(unittest.TestCase):
                    if f.path == "src/PluginProcessor.cpp")
         self.assertIn("Labelled silence", cpp)
         self.assertIn("out[i] = 0.0f;", cpp)
+
+
+class ConfidenceGatingTest(unittest.TestCase):
+    """Honesty gate (plan §§7.4/16.3): a low-confidence param must downgrade to a
+    labelled TODO stub, never emit its guessed value as if certain. A
+    high-confidence param emits the concrete add_parameter block."""
+
+    def _cpp(self, ir, **kw):
+        return next(f.content for f in produce(ir, **kw)["files"]
+                    if f.path == "src/PluginProcessor.cpp")
+
+    def test_high_confidence_emits_concrete_value(self):
+        ir = _ir()  # gain confidence 0.9
+        cpp = self._cpp(ir)
+        self.assertIn("store.add_parameter({", cpp)
+        self.assertIn(".range = {-60.0f, 12.0f, 0.0f, 0.1f, 0.25f, false}", cpp)
+        self.assertNotIn("low-confidence", cpp)
+
+    def test_low_confidence_downgrades_to_todo_stub(self):
+        ir = _ir()
+        ir["parameters"][0]["confidence"] = 0.2
+        cpp = self._cpp(ir)
+        # Labelled TODO naming the low confidence; no LIVE add_parameter call.
+        self.assertIn("TODO(import): low-confidence (Gain, confidence 0.2) — "
+                      "verify before trusting.", cpp)
+        self.assertIn("GUESSED — verify", cpp)
+        # The concrete registration is commented out, never emitted live.
+        self.assertNotIn("\n        store.add_parameter({", cpp)
+        self.assertIn("// store.add_parameter({", cpp)
+
+    def test_floor_is_configurable_and_boundary_is_strict_less_than(self):
+        ir = _ir()
+        ir["parameters"][0]["confidence"] = 0.5  # exactly at the default floor
+        # At the floor: NOT below it -> concrete value (strict <).
+        self.assertIn("store.add_parameter({", self._cpp(ir))
+        # Raise the floor above 0.5 -> now gated.
+        cpp = self._cpp(ir, confidence_floor=0.6)
+        self.assertIn("TODO(import): low-confidence", cpp)
+
+    def test_default_floor_constant_value(self):
+        self.assertEqual(DEFAULT_CONFIDENCE_FLOOR, 0.5)
+
+
+class StateSkeletonTest(unittest.TestCase):
+    """The emitted serialize/deserialize_plugin_state hooks are a working
+    param-state save/restore skeleton (APVTS / IParam -> Pulp state bridge)."""
+
+    def _cpp(self, ir):
+        return next(f.content for f in produce(ir)["files"]
+                    if f.path == "src/PluginProcessor.cpp")
+
+    def test_default_state_round_trips_params(self):
+        cpp = self._cpp(_ir())
+        # serialize snapshots the StateStore param payload...
+        self.assertIn("std::vector<uint8_t> blob = state().serialize();", cpp)
+        self.assertIn("return blob;", cpp)
+        # ...and deserialize restores it (with the empty-payload legacy path).
+        self.assertIn("if (data.empty())", cpp)
+        self.assertIn("if (!state().deserialize(data))", cpp)
+        # no stale "return {};" stub.
+        self.assertNotIn("    return {};", cpp)
+
+    def test_opaque_state_keeps_session_compat_todo(self):
+        ir = _ir()
+        ir["state_model"]["classification"] = "opaque-custom"
+        cpp = self._cpp(ir)
+        # Param state still round-trips...
+        self.assertIn("state().serialize();", cpp)
+        # ...but binary session compat is an explicit TODO, not a silent claim.
+        self.assertIn("binary", cpp.lower())
+        self.assertIn("DAW-session compatibility with the original plugin is NOT "
+                      "supported", cpp)
 
 
 class InjectionTest(unittest.TestCase):

@@ -48,10 +48,26 @@ from typing import Callable
 
 __all__ = [
     "FileSpec",
+    "DEFAULT_CONFIDENCE_FLOOR",
     "produce",
     "emit",
     "make_framework_free_predicate",
 ]
+
+
+# Confidence floor for emitting a concrete parameter value. The INSPECT step
+# scores every parameter with a `confidence` in [0, 1]; a value below this floor
+# was inferred from non-literal / data-driven / runtime-computed source (e.g. an
+# iPlug2 InitDouble with computed arguments, or a JUCE range built from a runtime
+# expression) and is therefore a GUESS, not a fact. Honesty rule (plan §§7.4/16.3):
+# never emit a guessed value as if it were certain. Below the floor we emit a
+# clearly-labelled `// TODO(import): low-confidence … — verify before trusting`
+# stub instead of a concrete `store.add_parameter({...})` block.
+#
+# 0.5 splits the importers' two confidence bands cleanly: statically-resolved
+# params score high (~0.9+), computed/data-driven params score low (~0.2), so the
+# floor downgrades exactly the guessed ones and leaves the resolved ones concrete.
+DEFAULT_CONFIDENCE_FLOOR = 0.5
 
 
 # --- naming helpers ---------------------------------------------------------
@@ -155,8 +171,16 @@ def _param_id_enum(params: list[dict]) -> list[tuple[str, int, str]]:
     return out
 
 
-def _emit_param_registration(p: dict, enum_name: str, id_label: str) -> list[str]:
-    """One store.add_parameter({...}) block for a resolvable IR parameter."""
+def _emit_param_registration(p: dict, enum_name: str, id_label: str,
+                             confidence_floor: float) -> list[str]:
+    """One store.add_parameter({...}) block for a resolvable IR parameter.
+
+    Honesty gate (plan §§7.4/16.3): when the IR's `confidence` for this param is
+    below `confidence_floor`, the resolved id/name/range/default came from a
+    non-literal / runtime-computed source and is a GUESS. We must not emit it as
+    if certain — instead emit a clearly-labelled `// TODO(import)` stub naming
+    the low confidence so the porter verifies before trusting it.
+    """
     rng = p.get("pulp_range") or {}
     lines: list[str] = []
     curve = p.get("source_curve") or {}
@@ -164,6 +188,35 @@ def _emit_param_registration(p: dict, enum_name: str, id_label: str) -> list[str
     symmetric = bool(curve.get("symmetric", False))
     shaped = (skew not in (None, 1.0)) or symmetric
     src_id = p.get("source_id_string") or p.get("id")
+
+    conf = p.get("confidence")
+    try:
+        low_confidence = conf is not None and float(conf) < confidence_floor
+    except (TypeError, ValueError):
+        low_confidence = False
+
+    if low_confidence:
+        # Downgrade to a labelled stub — do NOT emit the guessed concrete value.
+        name_hint = _cpp_str(p.get("name") or src_id)
+        df = _cpp_float(p.get("default"), 0.0)
+        lines.append(f"        // TODO(import): low-confidence ({name_hint}, "
+                     f"confidence {conf}) — verify before trusting.")
+        lines.append("        //   The source values below were inferred from a "
+                     "non-literal / runtime-computed")
+        lines.append("        //   construct, so they are a GUESS, not a fact "
+                     "(plan §§7.4/16.3). Confirm the")
+        lines.append("        //   id/name/range/default against the original "
+                     "plugin, then uncomment:")
+        lines.append(f"        // store.add_parameter({{")
+        lines.append(f"        //     .id = {enum_name},")
+        lines.append(f'        //     .name = "{name_hint}",')
+        mn_c = _cpp_float(rng.get("min"), 0.0)
+        mx_c = _cpp_float(rng.get("max"), 1.0)
+        st_c = _cpp_float(rng.get("step"), 0.0)
+        lines.append(f"        //     .range = {{{mn_c}, {mx_c}, {df}, {st_c}}},  "
+                     f"// GUESSED — verify")
+        lines.append("        // });")
+        return lines
 
     lines.append(f"        // source {id_label} id \"{_cpp_str(src_id)}\" "
                  f"(version hint {p.get('source_version_hint')}), "
@@ -407,9 +460,62 @@ def _gen_header(ir: dict, class_name: str, factory_name: str, namespace: str,
     return "\n".join(L)
 
 
+def _emit_state_skeleton(class_name: str, opaque: bool) -> list[str]:
+    """The serialize/deserialize_plugin_state bodies — a working param-state
+    save/restore skeleton (the APVTS / IParam -> Pulp state bridge).
+
+    The skeleton round-trips the StateStore parameter payload via
+    `state().serialize()` / `state().deserialize()` — a real, compiling
+    round-trip the porter can run and trust — and labels any opaque/binary
+    session blob the source plugin owned as a `// TODO(import)` that must be
+    re-modelled by hand (binary DAW-session compatibility with the original is
+    not supported, plan §7.4).
+    """
+    L: list[str] = []
+    L.append(f"std::vector<uint8_t> {class_name}::serialize_plugin_state() const {{")
+    L.append("    // Parameter state: the registered StateStore parameters are the")
+    L.append("    // imported APVTS / IParam values. The format adapter already")
+    L.append("    // persists them with the host session, so returning {} here is")
+    L.append("    // sufficient for parameter recall. We additionally serialize the")
+    L.append("    // StateStore payload explicitly so this hook is a self-contained,")
+    L.append("    // round-trippable snapshot of the parameter state (verify with a")
+    L.append("    // save -> deserialize_plugin_state -> compare round-trip test).")
+    L.append("    std::vector<uint8_t> blob = state().serialize();")
+    if opaque:
+        L.append("    // TODO(import): the source plugin also wrote a hand-rolled binary blob")
+        L.append("    // (custom getStateInformation / IByteChunk serializer).")
+        L.append("    // Binary DAW-session compatibility with the original plugin is NOT "
+                 "supported")
+        L.append("    // (plan §7.4) — append your re-modelled plugin-owned state to `blob`")
+        L.append("    // here once it has been ported.")
+    else:
+        L.append("    // TODO(import): if this plugin owns extra non-parameter state")
+        L.append("    // (sample slots, learned curves, ...), append it to `blob` here.")
+    L.append("    return blob;")
+    L.append("}")
+    L.append("")
+    L.append(f"bool {class_name}::deserialize_plugin_state("
+             "std::span<const uint8_t> data) {")
+    L.append("    // Empty payload => legacy/parameter-only state; nothing to restore")
+    L.append("    // beyond the adapter's automatic StateStore recall.")
+    L.append("    if (data.empty())")
+    L.append("        return true;")
+    L.append("    // Restore the parameter snapshot written by serialize_plugin_state().")
+    L.append("    if (!state().deserialize(data))")
+    L.append("        return false;")
+    if opaque:
+        L.append("    // TODO(import): parse and restore the re-modelled plugin-owned state")
+        L.append("    // appended above. No binary-compatible restore of the ORIGINAL")
+        L.append("    // plugin's session blob is provided — see serialize_plugin_state.")
+    L.append("    return true;")
+    L.append("}")
+    return L
+
+
 def _gen_source(ir: dict, class_name: str, factory_name: str, namespace: str,
                 params: list[tuple[str, int, str]], header_name: str,
-                copied_cores: list[str], id_label: str) -> str:
+                copied_cores: list[str], id_label: str,
+                confidence_floor: float) -> str:
     state = ir.get("state_model", {})
     opaque = state.get("classification") == "opaque-custom"
     ir_params = ir.get("parameters", [])
@@ -428,7 +534,8 @@ def _gen_source(ir: dict, class_name: str, factory_name: str, namespace: str,
     if params:
         for enum, _pid, sid in params:
             p = by_sid.get(sid, {})
-            L.extend(_emit_param_registration(p, enum, id_label))
+            L.extend(_emit_param_registration(p, enum, id_label,
+                                              confidence_floor))
     else:
         L.append("    // No statically-resolvable parameters were found.")
         L.append("    (void)store;")
@@ -465,32 +572,18 @@ def _gen_source(ir: dict, class_name: str, factory_name: str, namespace: str,
     L.append("}")
     L.append("")
 
-    # serialize / deserialize
-    L.append(f"std::vector<uint8_t> {class_name}::serialize_plugin_state() const {{")
-    if opaque:
-        L.append("    // TODO(import): source used a custom getStateInformation that "
-                 "writes a hand-rolled")
-        L.append("    // binary blob. Binary DAW-session compatibility with the "
-                 "original plugin is NOT")
-        L.append("    // supported (plan §7.4). Pulp persists StateStore parameters "
-                 "automatically; this")
-        L.append("    // hook is only for extra plugin-owned state, which must be "
-                 "re-modelled by hand.")
-    else:
-        L.append("    // Parameters persist via StateStore automatically. Override "
-                 "this only if the")
-        L.append("    // plugin owns extra non-parameter state to serialize.")
-    L.append("    return {};")
-    L.append("}")
-    L.append("")
-    L.append(f"bool {class_name}::deserialize_plugin_state("
-             "std::span<const uint8_t> data) {")
-    L.append("    (void)data;")
-    if opaque:
-        L.append("    // TODO(import): no binary-compatible restore — see "
-                 "serialize_plugin_state above.")
-    L.append("    return true;")
-    L.append("}")
+    # serialize / deserialize — param-state save/restore skeleton.
+    #
+    # This is the source framework's parameter-state bridge (APVTS /
+    # AudioProcessorValueTreeState on one side, IPlugAPIBase / IParam on the
+    # other) mapped onto Pulp's state model. In Pulp the registered StateStore
+    # parameters already round-trip through the format adapter automatically, so
+    # the parameter half of the bridge is DONE the moment define_parameters()
+    # ran. The hooks below are the *extra* plugin-owned-state half: a working,
+    # compiling skeleton that round-trips the StateStore param payload itself
+    # (honest, verifiable) plus a TODO for any opaque/binary session state the
+    # adapter cannot model for you.
+    L.extend(_emit_state_skeleton(class_name, opaque))
     L.append("")
 
     # factory
@@ -771,7 +864,8 @@ def produce(ir: dict, source_dir: Path | None = None,
             emit_tool: str = "pulp-importer-substrate-emit/0.0.0",
             id_label: str = "param",
             tool_label: str = "",
-            boundary_name_markers: list[str] | None = None) -> dict:
+            boundary_name_markers: list[str] | None = None,
+            confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR) -> dict:
     """Pure production step: turn a ProjectIR into the set of files a Pulp
     migration scaffold consists of, WITHOUT touching the output directory.
 
@@ -791,6 +885,12 @@ def produce(ir: dict, source_dir: Path | None = None,
         boundary/metadata headers that must NOT be copied verbatim as a portable
         DSP core (e.g. the importer's `PluginProcessor`/`PluginEditor` or
         metadata `config.h`). Defaults to [] so the substrate names no file.
+      - `confidence_floor` gates concrete value emission (plan §§7.4/16.3): a
+        parameter whose IR `confidence` is below the floor was inferred from a
+        non-literal / runtime-computed source, so its resolved value is a guess.
+        Below the floor the param is emitted as a labelled `// TODO(import):
+        low-confidence …` stub instead of a concrete `add_parameter` call.
+        Defaults to `DEFAULT_CONFIDENCE_FLOOR` (0.5).
 
     Returns a dict with:
       - "files": list[FileSpec] — every scaffold file, with content (generated/
@@ -848,7 +948,8 @@ def produce(ir: dict, source_dir: Path | None = None,
                           classification="source",
                           content=_gen_source(ir, class_name, factory_name,
                                               namespace, params, header_name,
-                                              copied_cores, id_label)))
+                                              copied_cores, id_label,
+                                              confidence_floor)))
     files.append(FileSpec("src/clap_entry.cpp", provenance="generated",
                           classification="source",
                           content=_gen_clap_entry(factory_name, namespace,
@@ -913,14 +1014,16 @@ def emit(ir: dict, out_dir: Path, source_dir: Path | None = None,
          emit_tool: str = "pulp-importer-substrate-emit/0.0.0",
          id_label: str = "param",
          tool_label: str = "",
-         boundary_name_markers: list[str] | None = None) -> dict:
+         boundary_name_markers: list[str] | None = None,
+         confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR) -> dict:
     """Materialise a scaffold on disk. Thin shell over `produce()`: writes each
     FileSpec (content -> write, copy_from -> verbatim copy) under `out_dir`."""
     prod = produce(ir, source_dir=source_dir, sdk_version=sdk_version,
                    render_report=render_report,
                    framework_free_predicate=framework_free_predicate,
                    emit_tool=emit_tool, id_label=id_label, tool_label=tool_label,
-                   boundary_name_markers=boundary_name_markers)
+                   boundary_name_markers=boundary_name_markers,
+                   confidence_floor=confidence_floor)
     out_dir.mkdir(parents=True, exist_ok=True)
     for spec in prod["files"]:
         dest = out_dir / spec.path
