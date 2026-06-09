@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulp-importer-substrate"
+version = "0.0.0"
+description = "Vendor-agnostic extraction core shared by Pulp framework importers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Pulp" }]
+keywords = ["pulp", "importer", "libclang", "extraction"]
+dependencies = [
+    # The Python libclang binding. The shipped importer pins its own
+    # LLVM/libclang; the substrate spike uses whatever the developer has.
+    "libclang",
+]
+
+[project.urls]
+Homepage = "https://github.com/danielraffel/pulp"
+
+[tool.setuptools]
+packages = ["pulp_importer_substrate"]
