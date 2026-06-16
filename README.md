@@ -1,7 +1,7 @@
 # pulp-importer-substrate
 
-The **vendor-agnostic extraction core** shared by Pulp's framework importers
-(`pulp-import-juce`, `pulp-import-iplug`, …).
+The **vendor-agnostic extraction core** shared by Pulp's per-framework
+importer packages.
 
 Each importer turns *the user's own* plugin source into a draft Pulp
 `ProjectIR.json` by parsing it with libclang. A large fraction of that work —
