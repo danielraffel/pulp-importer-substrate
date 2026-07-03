@@ -171,6 +171,68 @@ def _param_id_enum(params: list[dict]) -> list[tuple[str, int, str]]:
     return out
 
 
+def _param_discrete_divisor(p: dict) -> int | None:
+    """The normalization divisor (normDen) for a DISCRETE parameter: the number
+    of intervals between its positions, so a UI maps position `i` to `i /
+    divisor` in [0, 1] (an N-position control has divisor N-1). Derived once,
+    here, from the parameter's own definition so a generated binding cannot
+    disagree with it — the class of hand-transcription bug where a 3-option
+    control is wired to a 6-step divisor is impossible when the divisor is
+    codegen'd from the same `choices` the parameter carries.
+
+    Only genuinely discrete parameters get a divisor:
+      - a choice/enum parameter -> len(choices) - 1;
+      - an integer control (an exact step of 1 over integer bounds, e.g. a JUCE
+        AudioParameterInt / iPlug2 int param) -> max - min.
+    A continuous parameter — including one with a fine cosmetic step like 0.1 —
+    returns None; its knob is not quantized and has no divisor.
+    """
+    choices = p.get("choices")
+    if choices:
+        n = len(choices)
+        return n - 1 if n > 1 else None
+    rng = p.get("pulp_range") or {}
+    step, mn, mx = rng.get("step"), rng.get("min"), rng.get("max")
+    try:
+        if step is not None and float(step) == 1.0 \
+                and float(mn).is_integer() and float(mx).is_integer():
+            span = int(round(float(mx) - float(mn)))
+            return span if span >= 1 else None
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _gen_param_bind_grid(ir: dict) -> list[dict]:
+    """The authoritative widget-binding table for the import: one entry per
+    resolvable parameter carrying exactly what a generated UI binding needs — the
+    string key it binds by, the stable id, the range, and (for a discrete
+    control) the normalization divisor derived from the source's own option
+    count. Emitted once from the shared IR so a JUCE *or* iPlug2 UI scaffold
+    reads the divisor from ONE place that cannot disagree with the parameter it
+    binds (porting-feedback ask: codegen the bind-grid from the definitions).
+    """
+    grid: list[dict] = []
+    for p in ir.get("parameters", []):
+        key = p.get("source_id_string") or p.get("id")
+        if key is None or p.get("proposed_pulp_id") is None:
+            continue  # unresolved params are surfaced as constructs/TODOs
+        rng = p.get("pulp_range") or {}
+        entry = {
+            "key": key,
+            "id": p.get("proposed_pulp_id"),
+            "name": p.get("name") or key,
+            "min": rng.get("min"),
+            "max": rng.get("max"),
+            "step": rng.get("step"),
+            "discrete_divisor": _param_discrete_divisor(p),
+        }
+        if p.get("choices"):
+            entry["choices"] = list(p.get("choices"))
+        grid.append(entry)
+    return grid
+
+
 def _emit_param_registration(p: dict, enum_name: str, id_label: str,
                              confidence_floor: float) -> list[str]:
     """One store.add_parameter({...}) block for a resolvable IR parameter.
@@ -250,6 +312,16 @@ def _emit_param_registration(p: dict, enum_name: str, id_label: str,
         lines.append(f"            .range = {{{mn}, {mx}, {df}, {st}, {sk}, {sym}}},")
     else:
         lines.append(f"            .range = {{{mn}, {mx}, {df}, {st}}},")
+    divisor = _param_discrete_divisor(p)
+    if divisor is not None:
+        # Authoritative, codegen'd from this parameter's own definition: a UI
+        # binding maps discrete position i -> i/divisor in [0,1]. Generating it
+        # here (not hand-writing it in the UI) is what stops a control's step
+        # count from disagreeing with the parameter — see migration_status.json's
+        # bind_grid for the machine-readable table a UI scaffold consumes.
+        lines.append(f"            // bind-grid: discrete control, normalized "
+                     f"position = index / {divisor} (divisor codegen'd from the "
+                     f"source's option count)")
     if choices:
         # to_string table for a discrete choice param.
         labels = ", ".join(f'"{_cpp_str(c)}"' for c in choices)
@@ -1094,6 +1166,7 @@ def _gen_migration_status(ir: dict, copied_cores: list[str],
             {"file": c, "provenance": "copied-user-file"} for c in copied_cores
         ],
         "constructs": ir.get("constructs", []),
+        "bind_grid": _gen_param_bind_grid(ir),
         "todos": todos,
         "confidence_overall": ir.get("confidence_overall"),
     }

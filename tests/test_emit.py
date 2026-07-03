@@ -29,10 +29,24 @@ sys.path.insert(0, str(HERE.parent))
 from pulp_importer_substrate.emit import (  # noqa: E402
     DEFAULT_CONFIDENCE_FLOOR,
     FileSpec,
+    _gen_param_bind_grid,
+    _param_discrete_divisor,
     emit,
     make_framework_free_predicate,
     produce,
 )
+
+
+def _choice_param(choices, **over):
+    """A resolvable choice/enum parameter (JUCE AudioParameterChoice shape)."""
+    p = {
+        "id": "osc_wave", "source_id_string": "osc_wave",
+        "proposed_pulp_id": 777, "name": "Osc Wave",
+        "pulp_range": {"min": 0, "max": max(len(choices) - 1, 0), "step": 1},
+        "default": 0, "choices": list(choices), "confidence": 0.9,
+    }
+    p.update(over)
+    return p
 
 
 def _ir(**over) -> dict:
@@ -365,6 +379,65 @@ class FileSpecTest(unittest.TestCase):
                      copy_from="/abs/a.h").as_manifest_entry()
         self.assertEqual(e["copy_from"], "/abs/a.h")
         self.assertNotIn("content", e)
+
+
+class BindGridTest(unittest.TestCase):
+    """The bind-grid codegen: the discrete normalization divisor (normDen) is
+    derived once from the parameter's own definition so a UI binding cannot
+    disagree with it — the 3-option-control-wired-to-a-6-step-divisor class of
+    hand-transcription bug is impossible when the divisor is generated."""
+
+    def test_divisor_is_option_count_minus_one(self):
+        # A 3-option control has divisor 2 (positions 0,1,2 -> 0, .5, 1), NOT 6.
+        self.assertEqual(_param_discrete_divisor(_choice_param(["A", "B", "C"])), 2)
+        self.assertEqual(
+            _param_discrete_divisor(_choice_param(["Saw", "Sq", "Tri", "Sin"])), 3)
+
+    def test_single_or_empty_choice_has_no_divisor(self):
+        self.assertIsNone(_param_discrete_divisor(_choice_param(["Only"])))
+        self.assertIsNone(_param_discrete_divisor(_choice_param([])))
+
+    def test_integer_control_divisor_is_the_span(self):
+        intp = {"source_id_string": "voices", "proposed_pulp_id": 9,
+                "pulp_range": {"min": 1, "max": 8, "step": 1}}
+        self.assertEqual(_param_discrete_divisor(intp), 7)  # 1..8 -> 7 intervals
+
+    def test_continuous_param_has_no_divisor(self):
+        # The _ir() gain is {-60, 12, step 0.1} — a fine cosmetic step must NOT be
+        # mistaken for a 720-position discrete control.
+        self.assertIsNone(_param_discrete_divisor(_ir()["parameters"][0]))
+
+    def test_bind_grid_entry_carries_divisor_and_key(self):
+        ir = _ir()
+        ir["parameters"] = [_choice_param(["A", "B", "C"]), ir["parameters"][0]]
+        grid = _gen_param_bind_grid(ir)
+        self.assertEqual(len(grid), 2)
+        choice, gain = grid[0], grid[1]
+        self.assertEqual(choice["key"], "osc_wave")
+        self.assertEqual(choice["discrete_divisor"], 2)
+        self.assertEqual(choice["choices"], ["A", "B", "C"])
+        self.assertIsNone(gain["discrete_divisor"])  # continuous
+        self.assertNotIn("choices", gain)
+
+    def test_unresolved_param_is_skipped(self):
+        ir = _ir()
+        ir["parameters"] = [{"source_id_string": None, "proposed_pulp_id": None}]
+        self.assertEqual(_gen_param_bind_grid(ir), [])
+
+    def test_manifest_exposes_bind_grid(self):
+        ir = _ir()
+        ir["parameters"] = [_choice_param(["A", "B", "C"])]
+        status = produce(ir)["migration_status"]
+        self.assertIn("bind_grid", status)
+        self.assertEqual(status["bind_grid"][0]["discrete_divisor"], 2)
+
+    def test_emitted_registration_documents_the_divisor(self):
+        ir = _ir()
+        ir["parameters"] = [_choice_param(["A", "B", "C"])]
+        cpp = next(f.content for f in produce(ir)["files"]
+                   if f.path == "src/PluginProcessor.cpp")
+        self.assertIn("normalized position = index / 2", cpp)
+        self.assertNotIn("index / 6", cpp)  # the transcription bug never appears
 
 
 if __name__ == "__main__":
