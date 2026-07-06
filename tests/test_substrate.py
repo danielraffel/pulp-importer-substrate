@@ -10,6 +10,8 @@ Run: python3 tests/test_substrate.py
 """
 from __future__ import annotations
 
+import io
+import json
 import pathlib
 import re
 import sys
@@ -27,6 +29,7 @@ from pulp_importer_substrate import (  # noqa: E402
     fnv1a_u32,
     numeric_seq,
 )
+from pulp_importer_substrate import spi  # noqa: E402
 
 
 class NumericSeqTest(unittest.TestCase):
@@ -105,6 +108,90 @@ class MappingTest(unittest.TestCase):
         self.assertEqual(CATEGORY_TO_PULP["effect"], "Effect")
         self.assertEqual(CATEGORY_TO_PULP["instrument"], "Instrument")
         self.assertEqual(CATEGORY_TO_PULP["midi_effect"], "MidiEffect")
+
+
+class SpiShellTest(unittest.TestCase):
+    """The vendor-agnostic SPI verb-envelope + JSON-stdio shell. Pure (no
+    libclang): the shell only frames envelopes and dispatches to injected verb
+    handlers, so it is tested with trivial in-memory handlers. This is the
+    behaviour both importers' spi.py used to duplicate byte-for-byte; it can now
+    only live here."""
+
+    def _run(self, requests: list[dict], handlers=None) -> list[dict]:
+        """Drive main_cli over in-memory stdio; return parsed responses."""
+        if handlers is None:
+            handlers = {
+                "detect": lambda p: {"echo": p.get("project_dir")},
+                "boom": lambda p: (_ for _ in ()).throw(RuntimeError("kaboom")),
+            }
+        stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
+        stdout = io.StringIO()
+        rc = spi.main_cli(handlers, framework_id="acme", importer_id="acme-spike",
+                          stdin=stdin, stdout=stdout)
+        self.assertEqual(rc, 0)
+        return [json.loads(ln) for ln in stdout.getvalue().splitlines() if ln.strip()]
+
+    def test_dispatch_calls_injected_handler(self):
+        [resp] = self._run([{
+            "spi_version": 0, "verb": "detect", "id": "d1",
+            "payload": {"project_dir": "/proj"},
+        }])
+        self.assertEqual(resp["spi_version"], 0)
+        self.assertEqual(resp["id"], "d1")
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["result"], {"echo": "/proj"})
+
+    def test_unimplemented_verb_is_honest(self):
+        [resp] = self._run([{"spi_version": 0, "verb": "plan", "id": "p1",
+                             "payload": {}}])
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "unimplemented_verb")
+
+    def test_spi_version_mismatch_is_loud(self):
+        [resp] = self._run([{"spi_version": 99, "verb": "detect", "id": "v1",
+                             "payload": {}}])
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "spi_version_mismatch")
+
+    def test_handler_exception_becomes_error_envelope(self):
+        # A raising handler must not crash the wire — it becomes an honest error.
+        [resp] = self._run([{"spi_version": 0, "verb": "boom", "id": "b1",
+                             "payload": {}}])
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "analyze_error")
+        self.assertIn("kaboom", resp["error"]["message"])
+
+    def test_bad_json_line_is_reported(self):
+        stdin = io.StringIO("not json\n")
+        stdout = io.StringIO()
+        rc = spi.main_cli({}, framework_id="acme", importer_id="acme-spike",
+                          stdin=stdin, stdout=stdout)
+        self.assertEqual(rc, 0)
+        [resp] = [json.loads(ln) for ln in stdout.getvalue().splitlines() if ln.strip()]
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "bad_json")
+
+    def test_batch_and_blank_lines(self):
+        # Blank lines are skipped; every real request gets exactly one response,
+        # ids preserved in order.
+        reqs = [{"spi_version": 0, "verb": "detect", "id": str(i),
+                 "payload": {"project_dir": f"/p{i}"}} for i in range(3)]
+        stdin = io.StringIO(
+            "\n".join(json.dumps(r) for r in reqs).replace("\n", "\n\n") + "\n")
+        stdout = io.StringIO()
+        spi.main_cli({"detect": lambda p: {"echo": p.get("project_dir")}},
+                     framework_id="acme", importer_id="acme-spike",
+                     stdin=stdin, stdout=stdout)
+        resps = [json.loads(ln) for ln in stdout.getvalue().splitlines() if ln.strip()]
+        self.assertEqual([r["id"] for r in resps], ["0", "1", "2"])
+
+    def test_handle_is_directly_usable(self):
+        # handle() is the single-envelope primitive main_cli loops over.
+        resp = spi.handle({"spi_version": 0, "verb": "detect", "id": "x",
+                           "payload": {"project_dir": "/z"}},
+                          {"detect": lambda p: {"echo": p["project_dir"]}})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["result"], {"echo": "/z"})
 
 
 def _libclang_available() -> bool:
