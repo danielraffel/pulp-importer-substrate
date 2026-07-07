@@ -180,6 +180,62 @@ class ProduceShapeTest(unittest.TestCase):
             self.assertTrue(any("demo-tuning" in t for t in status["todos"]))
             self.assertTrue(any("DEMO_ENABLE_TUNING=ON" in t for t in status["todos"]))
 
+    def test_tuning_requirements_emit_pulp_provider_helper(self):
+        ir = _ir(integration_requirements={
+            "packages": [{
+                "id": "mts-esp",
+                "feature_key": "mts_esp_microtuning",
+                "required": True,
+                "reason": "Source project calls the MTS-ESP client API.",
+                "cmake_targets": ["mts_esp_client"],
+            }, {
+                "id": "sst-tuning-library",
+                "feature_key": "local_tuning_files",
+                "required": True,
+                "reason": "Source project loads Scala SCL/KBM tuning files.",
+                "cmake_targets": ["sst::tuning-library"],
+            }, {
+                "id": "demo-tuning",
+                "feature_key": "other_tuning_extension",
+                "required": False,
+                "reason": "A non-Pulp tuning helper remains directly linked.",
+                "cmake_targets": ["demo::tuning"],
+            }],
+            "cmake_options": [{
+                "name": "PULP_ENABLE_MTS_ESP",
+                "value": True,
+                "reason": "Enable MTS-ESP when building Pulp from source.",
+            }, {
+                "name": "PULP_ENABLE_SCALA_TUNING",
+                "value": True,
+                "reason": "Enable Scala tuning when building Pulp from source.",
+            }],
+        })
+
+        cmake = next(f.content for f in produce(ir)["files"]
+                     if f.path == "CMakeLists.txt")
+        self.assertIn("pulp add mts-esp", cmake)
+        self.assertIn("pulp add sst-tuning-library", cmake)
+        self.assertIn("if(COMMAND pulp_enable_midi_tuning_provider)", cmake)
+        self.assertIn(
+            "pulp_enable_midi_tuning_provider(DemoGain MTS_ESP SCALA)",
+            cmake,
+        )
+        self.assertIn("Upgrade the Pulp SDK", cmake)
+        self.assertLess(
+            cmake.index("pulp_add_plugin(DemoGain"),
+            cmake.index("pulp_enable_midi_tuning_provider(DemoGain"),
+        )
+        self.assertNotIn(
+            "target_link_libraries(DemoGain PRIVATE mts_esp_client)",
+            cmake,
+        )
+        self.assertNotIn(
+            "target_link_libraries(DemoGain PRIVATE sst::tuning-library)",
+            cmake,
+        )
+        self.assertIn("target_link_libraries(DemoGain PRIVATE demo::tuning)", cmake)
+
     def test_instrument_emits_labelled_silence(self):
         ir = _ir()
         ir["metadata"]["pulp_category"] = "Instrument"
