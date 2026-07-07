@@ -121,6 +121,45 @@ class ProduceShapeTest(unittest.TestCase):
         self.assertIn("out[i] = 0.0f;", cpp)
 
 
+class AudioPrecisionTest(unittest.TestCase):
+    def _native_f64_ir(self):
+        ir = _ir()
+        ir["audio_precision"] = {
+            "source_native_f64": True,
+            "sample_type": "double",
+            "confidence": 0.9,
+            "evidence": ["JUCE double processBlock"],
+        }
+        return ir
+
+    def test_default_scaffold_does_not_claim_f64(self):
+        files = {f.path: f.content for f in produce(_ir())["files"]}
+        self.assertNotIn("supports_f64_audio", files["src/PluginProcessor.hpp"])
+        self.assertNotIn("process_f64", files["src/PluginProcessor.hpp"])
+        self.assertNotIn("process_f64", files["src/PluginProcessor.cpp"])
+        status = produce(_ir())["migration_status"]
+        self.assertFalse(status["audio_precision"]["source_native_f64"])
+
+    def test_native_f64_scaffold_sets_descriptor_and_emits_override(self):
+        files = {f.path: f.content for f in produce(self._native_f64_ir())["files"]}
+        hpp = files["src/PluginProcessor.hpp"]
+        cpp = files["src/PluginProcessor.cpp"]
+        self.assertIn(".supports_f64_audio = true", hpp)
+        self.assertIn("void process_f64(", hpp)
+        self.assertIn("void DemoGainProcessor::process_f64(", cpp)
+        self.assertIn("BufferView<double>& audio_output", cpp)
+        self.assertIn("do not fall back through the f32 path", cpp)
+        self.assertIn("out[i] = 0.0;", cpp)
+
+    def test_native_f64_status_records_evidence(self):
+        status = produce(self._native_f64_ir())["migration_status"]
+        precision = status["audio_precision"]
+        self.assertTrue(precision["source_native_f64"])
+        self.assertEqual(precision["sample_type"], "double")
+        self.assertEqual(precision["confidence"], 0.9)
+        self.assertEqual(precision["evidence"], ["JUCE double processBlock"])
+
+
 class ConfidenceGatingTest(unittest.TestCase):
     """Honesty gate (plan §§7.4/16.3): a low-confidence param must downgrade to a
     labelled TODO stub, never emit its guessed value as if certain. A

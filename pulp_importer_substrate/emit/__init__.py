@@ -146,6 +146,21 @@ FORMAT_MAP = {
 }
 
 
+# --- audio precision --------------------------------------------------------
+
+def _audio_precision(ir: dict) -> dict:
+    value = ir.get("audio_precision")
+    return value if isinstance(value, dict) else {}
+
+
+def _source_native_f64(ir: dict) -> bool:
+    return bool(_audio_precision(ir).get("source_native_f64"))
+
+
+def _zero_literal(sample_type: str) -> str:
+    return "0.0" if sample_type == "double" else "0.0f"
+
+
 # --- parameter emission -----------------------------------------------------
 
 def _param_id_enum(params: list[dict]) -> list[tuple[str, int, str]]:
@@ -338,7 +353,8 @@ def _emit_param_registration(p: dict, enum_name: str, id_label: str,
 
 # --- DSP body emission ------------------------------------------------------
 
-def _emit_process_body(ir: dict, copied_cores: list[str]) -> list[str]:
+def _emit_process_body(ir: dict, copied_cores: list[str],
+                       sample_type: str = "float") -> list[str]:
     """The process() body, chosen by the IR's dsp.classification.
 
     portable-core: copy-in -> copy-out, with a note pointing at the verbatim
@@ -352,6 +368,7 @@ def _emit_process_body(ir: dict, copied_cores: list[str]) -> list[str]:
     category = (ir.get("metadata", {}) or {}).get("pulp_category", "Effect")
     is_instrument = category == "Instrument"
     silence = is_instrument or cls == "labelled-silence"
+    zero = _zero_literal(sample_type)
 
     L: list[str] = []
     L.append(f"        // TODO(import): migrate DSP — {cls}")
@@ -409,7 +426,7 @@ def _emit_process_body(ir: dict, copied_cores: list[str]) -> list[str]:
         L.append("        for (std::size_t ch = 0; ch < audio_output.num_channels(); ++ch) {")
         L.append("            auto out = audio_output.channel(ch);")
         L.append("            for (std::size_t i = 0; i < audio_output.num_samples(); ++i)")
-        L.append("                out[i] = 0.0f;")
+        L.append(f"                out[i] = {zero};")
         L.append("        }")
     else:
         L.append("        // Pass-through scaffold: copy input to output verbatim.")
@@ -425,7 +442,7 @@ def _emit_process_body(ir: dict, copied_cores: list[str]) -> list[str]:
         L.append("        for (std::size_t ch = chans; ch < audio_output.num_channels(); ++ch) {")
         L.append("            auto out = audio_output.channel(ch);")
         L.append("            for (std::size_t i = 0; i < audio_output.num_samples(); ++i)")
-        L.append("                out[i] = 0.0f;")
+        L.append(f"                out[i] = {zero};")
         L.append("        }")
     return L
 
@@ -475,6 +492,8 @@ def _emit_descriptor(ir: dict, class_name: str) -> list[str]:
         L.append(f'            .vendor_url = "{_cpp_str(md.get("vendor_url"))}",')
     if md.get("vendor_email"):
         L.append(f'            .vendor_email = "{_cpp_str(md.get("vendor_email"))}",')
+    if _source_native_f64(ir):
+        L.append("            .supports_f64_audio = true,")
     L.append("        };")
     L.append("    }")
     return L
@@ -542,6 +561,14 @@ def _gen_header(ir: dict, class_name: str, factory_name: str, namespace: str,
     L.append("        pulp::midi::MidiBuffer& midi_in,")
     L.append("        pulp::midi::MidiBuffer& midi_out,")
     L.append("        const pulp::format::ProcessContext& context) override;")
+    if _source_native_f64(ir):
+        L.append("")
+        L.append("    void process_f64(")
+        L.append("        pulp::audio::BufferView<double>& audio_output,")
+        L.append("        const pulp::audio::BufferView<const double>& audio_input,")
+        L.append("        pulp::midi::MidiBuffer& midi_in,")
+        L.append("        pulp::midi::MidiBuffer& midi_out,")
+        L.append("        const pulp::format::ProcessContext& context) override;")
     L.append("")
     L.append("    std::vector<uint8_t> serialize_plugin_state() const override;")
     L.append("    bool deserialize_plugin_state(std::span<const uint8_t> data) override;")
@@ -1012,6 +1039,22 @@ def _gen_source(ir: dict, class_name: str, factory_name: str, namespace: str,
     L.append("}")
     L.append("")
 
+    if _source_native_f64(ir):
+        L.append(f"void {class_name}::process_f64(")
+        L.append("    pulp::audio::BufferView<double>& audio_output,")
+        L.append("    const pulp::audio::BufferView<const double>& audio_input,")
+        L.append("    pulp::midi::MidiBuffer& midi_in,")
+        L.append("    pulp::midi::MidiBuffer& midi_out,")
+        L.append("    const pulp::format::ProcessContext& context) {")
+        L.append("    (void)midi_in;")
+        L.append("    (void)midi_out;")
+        L.append("    (void)context;")
+        L.append("    // Source plugin advertised native double-precision audio. Keep this")
+        L.append("    // override wired so Pulp hosts do not fall back through the f32 path.")
+        L.extend(_emit_process_body(ir, copied_cores, sample_type="double"))
+        L.append("}")
+        L.append("")
+
     # serialize / deserialize — param-state save/restore skeleton.
     #
     # This is the source framework's parameter-state bridge (APVTS /
@@ -1153,6 +1196,12 @@ def _gen_migration_status(ir: dict, copied_cores: list[str],
         "source": ir.get("source", {}),
         "plugin": md.get("name"),
         "emit_tool": emit_tool,
+        "audio_precision": {
+            "source_native_f64": _source_native_f64(ir),
+            "sample_type": _audio_precision(ir).get("sample_type", "float"),
+            "confidence": _audio_precision(ir).get("confidence"),
+            "evidence": _audio_precision(ir).get("evidence", []),
+        },
         "ui_kind": ui_kind,
         "verdict": {
             "builds": "yes",
