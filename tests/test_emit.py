@@ -112,6 +112,74 @@ class ProduceShapeTest(unittest.TestCase):
                    if f.path == "src/PluginProcessor.hpp")
         self.assertIn("kParam_gain = 12345u", hpp)
 
+    def test_integration_requirements_emit_cmake_status_and_assets(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = pathlib.Path(td)
+            (src / "assets").mkdir()
+            scale = src / "assets" / "factory-scale.scl"
+            scale.write_text("! demo\n12\n!\n100.0\n", encoding="utf-8")
+            legacy_tun = src / "assets" / "legacy.tun"
+            legacy_tun.write_text("[Tuning]\n", encoding="utf-8")
+
+            ir = _ir(integration_requirements={
+                "packages": [{
+                    "id": "demo-tuning",
+                    "feature_key": "local_tuning_files",
+                    "required": True,
+                    "reason": "Source project loads local tuning files.",
+                    "cmake_targets": ["demo::tuning"],
+                }],
+                "cmake_options": [{
+                    "name": "DEMO_ENABLE_TUNING",
+                    "value": True,
+                    "reason": "Enable the generated tuning adapter.",
+                }],
+                "asset_inputs": [{
+                    "path": "assets/factory-scale.scl",
+                    "kind": "tuning_scale",
+                    "copy_policy": "copy_to_scaffold",
+                    "reason": "Preserve source-project tuning.",
+                }, {
+                    "path": "assets/legacy.tun",
+                    "kind": "tuning_file",
+                    "copy_policy": "copy_to_scaffold",
+                    "requires_manual_review": True,
+                    "reason": "Preserve source-project .tun asset.",
+                }],
+            })
+
+            prod = produce(ir, source_dir=src)
+            cmake = next(f.content for f in prod["files"]
+                         if f.path == "CMakeLists.txt")
+            self.assertIn("pulp add demo-tuning", cmake)
+            self.assertIn("include(cmake/pulp-packages.cmake OPTIONAL)", cmake)
+            self.assertIn("set(DEMO_ENABLE_TUNING ON CACHE BOOL", cmake)
+            self.assertLess(
+                cmake.index("set(DEMO_ENABLE_TUNING ON CACHE BOOL"),
+                cmake.index("find_package(Pulp"),
+            )
+            self.assertIn("if(TARGET demo::tuning)", cmake)
+            self.assertIn("target_link_libraries(DemoGain PRIVATE demo::tuning)", cmake)
+
+            copied = next(f for f in prod["files"]
+                          if f.path == "assets/imported/assets/factory-scale.scl")
+            self.assertEqual(copied.provenance, "copied-user-file")
+            self.assertEqual(copied.copy_from, str(scale.resolve()))
+            copied_tun = next(f for f in prod["files"]
+                              if f.path == "assets/imported/assets/legacy.tun")
+            self.assertEqual(copied_tun.provenance, "copied-user-file")
+            self.assertEqual(copied_tun.copy_from, str(legacy_tun.resolve()))
+
+            status = prod["migration_status"]
+            self.assertIn("integration_requirements", status)
+            self.assertIn("copied_integration_assets", status)
+            copied_status_paths = {
+                item["file"] for item in status["copied_integration_assets"]
+            }
+            self.assertIn("assets/imported/assets/legacy.tun", copied_status_paths)
+            self.assertTrue(any("demo-tuning" in t for t in status["todos"]))
+            self.assertTrue(any("DEMO_ENABLE_TUNING=ON" in t for t in status["todos"]))
+
     def test_instrument_emits_labelled_silence(self):
         ir = _ir()
         ir["metadata"]["pulp_category"] = "Instrument"

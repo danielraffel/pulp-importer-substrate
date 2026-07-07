@@ -19,6 +19,7 @@ from .libclang_setup import (
     system_include_args,
 )
 from .mappings import CATEGORY_TO_PULP
+from .integrations import detect_tuning_integration_requirements
 from .tokens import (
     all_strings,
     first_bool,
@@ -72,6 +73,8 @@ __all__ = [
     "_RUNTIME_REF_KINDS",
     # mappings
     "CATEGORY_TO_PULP",
+    # optional integrations
+    "detect_tuning_integration_requirements",
     # metadata
     "SPI_VERSION",
     "__version__",

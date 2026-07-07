@@ -43,8 +43,15 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable
+
+from .integration_requirements import (
+    cmake_value as _cmake_value,
+    gen_cmake_prelude as _gen_integration_cmake_prelude,
+    gen_target_links as _gen_integration_target_links,
+    integration_requirements as _integration_requirements,
+)
 
 __all__ = [
     "FileSpec",
@@ -1124,6 +1131,7 @@ def _gen_cmake(ir: dict, target: str, namespace: str, factory_name: str,
     L.append("set(CMAKE_CXX_STANDARD 20)")
     L.append("set(CMAKE_CXX_STANDARD_REQUIRED ON)")
     L.append("")
+    L.extend(_gen_integration_cmake_prelude(ir))
     L.append(f"find_package(Pulp {sdk_version} REQUIRED)")
     L.append("")
     L.append(f"pulp_add_plugin({target}")
@@ -1142,6 +1150,7 @@ def _gen_cmake(ir: dict, target: str, namespace: str, factory_name: str,
     L.append(f"{midi_block}")
     L.append(")")
     L.append("")
+    L.extend(_gen_integration_target_links(ir, target))
     return "\n".join(L)
 
 
@@ -1150,6 +1159,7 @@ def _gen_migration_status(ir: dict, copied_cores: list[str],
     md = ir.get("metadata", {})
     dsp = ir.get("dsp", {})
     state = ir.get("state_model", {})
+    integration_reqs = _integration_requirements(ir)
     todos: list[str] = []
 
     # Skewed / symmetric params now emit a shaped ParamRange that round-trips
@@ -1168,6 +1178,36 @@ def _gen_migration_status(ir: dict, copied_cores: list[str],
     if state.get("classification") == "opaque-custom":
         todos.append("opaque-custom state: binary session compatibility with the "
                      "original plugin is NOT supported")
+
+    for pkg in integration_reqs.get("packages", []) or []:
+        if not isinstance(pkg, dict):
+            continue
+        pkg_id = str(pkg.get("id") or "").strip()
+        if not pkg_id:
+            continue
+        tag = "required" if pkg.get("required", True) else "recommended"
+        reason = str(pkg.get("reason") or "source project integration").strip()
+        todos.append(f"enable Pulp package `{pkg_id}` ({tag}): {reason}")
+
+    for opt in integration_reqs.get("cmake_options", []) or []:
+        if not isinstance(opt, dict):
+            continue
+        name = str(opt.get("name") or "").strip()
+        if not name:
+            continue
+        value = opt.get("value", True)
+        reason = str(opt.get("reason") or "source project integration").strip()
+        todos.append(f"configure `{name}={_cmake_value(value)}`: {reason}")
+
+    for asset in integration_reqs.get("asset_inputs", []) or []:
+        if not isinstance(asset, dict):
+            continue
+        path = str(asset.get("path") or "").strip()
+        if not path:
+            continue
+        if asset.get("copy_policy") != "copy_to_scaffold":
+            reason = str(asset.get("reason") or "source asset requires review").strip()
+            todos.append(f"review source asset `{path}`: {reason}")
 
     # UI
     ui_kind = (ir.get("ui", {}) or {}).get("kind") or "native"
@@ -1214,6 +1254,7 @@ def _gen_migration_status(ir: dict, copied_cores: list[str],
         "copied_user_files": [
             {"file": c, "provenance": "copied-user-file"} for c in copied_cores
         ],
+        "integration_requirements": integration_reqs,
         "constructs": ir.get("constructs", []),
         "bind_grid": _gen_param_bind_grid(ir),
         "todos": todos,
@@ -1318,6 +1359,47 @@ def _portable_core_files(ir: dict, source_dir: Path | None,
         if not is_framework_free(text):
             continue  # not framework-free
         out.append(hdr)
+    return out
+
+
+def _safe_asset_destination(source_path: str) -> str | None:
+    posix = source_path.replace("\\", "/")
+    rel = PurePosixPath(posix)
+    if rel.is_absolute():
+        return None
+    if any(part in ("", ".", "..") for part in rel.parts):
+        return None
+    return str(PurePosixPath("assets", "imported", *rel.parts))
+
+
+def _integration_asset_files(ir: dict, source_dir: Path | None) -> list[FileSpec]:
+    if source_dir is None or not source_dir.exists():
+        return []
+    reqs = _integration_requirements(ir)
+    assets = [a for a in reqs.get("asset_inputs", []) if isinstance(a, dict)]
+    if not assets:
+        return []
+
+    root = source_dir.resolve()
+    out: list[FileSpec] = []
+    seen: set[str] = set()
+    for asset in assets:
+        if asset.get("copy_policy") != "copy_to_scaffold":
+            continue
+        source_path = str(asset.get("path") or "").strip()
+        dest = _safe_asset_destination(source_path)
+        if not dest or dest in seen:
+            continue
+        src = (source_dir / source_path).resolve()
+        try:
+            src.relative_to(root)
+        except ValueError:
+            continue
+        if not src.is_file():
+            continue
+        out.append(FileSpec(dest, provenance="copied-user-file",
+                            copy_from=str(src), classification="asset"))
+        seen.add(dest)
     return out
 
 
@@ -1437,6 +1519,7 @@ def produce(ir: dict, source_dir: Path | None = None,
     core_files = _portable_core_files(ir, source_dir, framework_free_predicate,
                                       boundary_name_markers)
     copied_cores: list[str] = [f"src/{cf.name}" for cf in core_files]
+    integration_assets = _integration_asset_files(ir, source_dir)
 
     params = _param_id_enum(ir.get("parameters", []))
 
@@ -1448,6 +1531,7 @@ def produce(ir: dict, source_dir: Path | None = None,
     for cf in core_files:
         files.append(FileSpec(f"src/{cf.name}", provenance="copied-user-file",
                               copy_from=str(cf), classification="source"))
+    files.extend(integration_assets)
 
     # Generated sources.
     files.append(FileSpec(f"src/{header_name}", provenance="generated",
@@ -1498,6 +1582,11 @@ def produce(ir: dict, source_dir: Path | None = None,
 
     # Migration status + report.
     status = _gen_migration_status(ir, copied_cores, emit_tool)
+    if integration_assets:
+        status["copied_integration_assets"] = [
+            {"file": f.path, "provenance": f.provenance}
+            for f in integration_assets
+        ]
     if deferred_formats:
         status.setdefault("todos", []).append(
             f"Enable additional plugin formats {deferred_formats}: Standalone needs a "
@@ -1524,6 +1613,7 @@ def produce(ir: dict, source_dir: Path | None = None,
         "namespace": namespace,
         "params": [e for e, _, _ in params],
         "copied_cores": copied_cores,
+        "copied_integration_assets": [f.path for f in integration_assets],
         "verdict": _verdict_line(status),
     }
 
