@@ -255,8 +255,8 @@ def detect_tuning_integration_requirements(project_dir: Path) -> tuple[dict, lis
         tasks.append("Review copied `.tun` assets: use MTS-ESP Mini/session tuning or convert them to `.scl` / `.kbm` before loading through `ScalaTuningProvider`.")
 
     if mts_refs and (scala_refs or scl_kbm_assets):
-        notes.append("Both session-wide MTS-ESP tuning and local SCL/KBM tuning were detected; generated Pulp code should prefer `MtsEspFallbackTuningProvider` so an active session master wins and local files remain the fallback.")
-        tasks.append("Use `pulp::midi::MtsEspFallbackTuningProvider` when both session tuning and local tuning files are present.")
+        notes.append("Both session-wide MTS-ESP tuning and local SCL/KBM tuning were detected; generated Pulp code should use `MtsEspFallbackTuningProvider` and choose the fallback policy that matches the product: the default central-session workflow lets an active MTS source win, while `MtsEspFallbackPolicy::PreferLocalTuning` preserves products whose local tuning UI should override the session.")
+        tasks.append("Use `pulp::midi::MtsEspFallbackTuningProvider` when both session tuning and local tuning files are present, and choose the MTS-vs-local fallback policy intentionally.")
 
     reqs: dict = {}
     if packages:
