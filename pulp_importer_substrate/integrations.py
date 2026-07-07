@@ -179,6 +179,8 @@ def detect_tuning_integration_requirements(project_dir: Path) -> tuple[dict, lis
     diagnostics: list[dict] = []
     tasks: list[str] = []
 
+    tun_refs = [{"file": _rel(project_dir, asset)} for asset in tun_assets]
+
     if mts_refs:
         packages.append({
             "id": "mts-esp",
@@ -201,6 +203,29 @@ def detect_tuning_integration_requirements(project_dir: Path) -> tuple[dict, lis
             "source_ref": mts_refs[0],
         })
         tasks.append("Map MTS-ESP note/frequency/status calls to `pulp::midi::TuningProvider` and keep client setup/status UI off the audio callback.")
+
+    if tun_assets and not mts_refs:
+        packages.append({
+            "id": "mts-esp",
+            "feature_key": "session_tuning",
+            "required": True,
+            "reason": "Source project includes .tun tuning assets; Pulp preserves them through MTS-ESP Mini/session tuning.",
+            "cmake_targets": ["mts_esp_client"],
+            "source_refs": tun_refs,
+        })
+        options.append({
+            "name": "PULP_ENABLE_MTS_ESP",
+            "value": True,
+            "reason": "Enable Pulp's provider-neutral MTS-ESP tuning provider for imported .tun assets.",
+            "source_refs": tun_refs,
+        })
+        diagnostics.append({
+            "severity": "info",
+            "code": "tuning.tun_session",
+            "message": ".tun tuning asset detected; scaffold will preserve it and enable MTS-ESP session tuning so MTS-ESP Mini can load it for the plugin.",
+            "source_ref": tun_refs[0],
+        })
+        tasks.append("Enable `pulp::midi::MtsEspTuningProvider` and load copied `.tun` assets through MTS-ESP Mini or another MTS-ESP master in the DAW session.")
 
     if scala_refs or scl_kbm_assets:
         refs = scala_refs or [{"file": _rel(project_dir, scl_kbm_assets[0])}]
@@ -242,17 +267,18 @@ def detect_tuning_integration_requirements(project_dir: Path) -> tuple[dict, lis
             "path": rel,
             "kind": "tuning_file",
             "copy_policy": "copy_to_scaffold",
-            "requires_manual_review": True,
-            "reason": "Preserve source-project .tun asset; direct .tun parsing is not represented by the Scala SCL/KBM provider.",
+            "supported_via": "mts_esp_session",
+            "reason": "Preserve source-project .tun asset for MTS-ESP Mini/session tuning.",
             "source_ref": {"file": rel},
         })
-        diagnostics.append({
-            "severity": "warning",
-            "code": "tuning.tun_manual_review",
-            "message": ".tun tuning asset detected; preserve it for review and use MTS-ESP Mini/session tuning or convert it to SCL/KBM.",
-            "source_ref": {"file": rel},
-        })
-        tasks.append("Review copied `.tun` assets: use MTS-ESP Mini/session tuning or convert them to `.scl` / `.kbm` before loading through `ScalaTuningProvider`.")
+        if mts_refs:
+            diagnostics.append({
+                "severity": "info",
+                "code": "tuning.tun_session",
+                "message": ".tun tuning asset detected; scaffold will preserve it for MTS-ESP Mini/session tuning.",
+                "source_ref": {"file": rel},
+            })
+            tasks.append("Load copied `.tun` assets through MTS-ESP Mini or another MTS-ESP master in the DAW session; the imported plugin follows via `MtsEspTuningProvider`.")
 
     if mts_refs and (scala_refs or scl_kbm_assets):
         notes.append("Both session-wide MTS-ESP tuning and local SCL/KBM tuning were detected; generated Pulp code should use `MtsEspFallbackTuningProvider` and choose the fallback policy that matches the product: the default central-session workflow lets an active MTS source win, while `MtsEspFallbackPolicy::PreferLocalTuning` preserves products whose local tuning UI should override the session.")
