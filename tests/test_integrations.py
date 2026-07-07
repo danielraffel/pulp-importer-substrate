@@ -39,7 +39,7 @@ class TuningIntegrationDetectionTest(unittest.TestCase):
             self.assertTrue(any(d["code"] == "tuning.mts_esp" for d in diagnostics))
             self.assertTrue(any("MtsEspFallbackTuningProvider" in t for t in tasks))
 
-    def test_tun_files_are_preserved_for_manual_review(self):
+    def test_tun_files_enable_mts_session_tuning(self):
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)
             (root / "tunings").mkdir()
@@ -47,12 +47,13 @@ class TuningIntegrationDetectionTest(unittest.TestCase):
 
             reqs, diagnostics, tasks = detect_tuning_integration_requirements(root)
 
-            self.assertNotIn("packages", reqs)
+            self.assertEqual({p["id"] for p in reqs["packages"]}, {"mts-esp"})
+            self.assertEqual({o["name"] for o in reqs["cmake_options"]}, {"PULP_ENABLE_MTS_ESP"})
             self.assertEqual(reqs["asset_inputs"][0]["copy_policy"], "copy_to_scaffold")
-            self.assertTrue(reqs["asset_inputs"][0]["requires_manual_review"])
+            self.assertEqual(reqs["asset_inputs"][0]["supported_via"], "mts_esp_session")
             self.assertEqual(reqs["asset_inputs"][0]["path"], "tunings/legacy.tun")
-            self.assertTrue(any(d["code"] == "tuning.tun_manual_review" for d in diagnostics))
-            self.assertTrue(any("`.tun`" in t for t in tasks))
+            self.assertTrue(any(d["code"] == "tuning.tun_session" for d in diagnostics))
+            self.assertTrue(any("MtsEspTuningProvider" in t for t in tasks))
 
     def test_ignores_generated_and_dependency_directories(self):
         with tempfile.TemporaryDirectory() as td:
