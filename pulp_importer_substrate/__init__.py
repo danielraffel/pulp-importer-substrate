@@ -31,6 +31,10 @@ from .discovery import (
     JUCE_SPEC,
     IPLUG2_SPEC,
 )
+from .health import (
+    extraction_health,
+    stamp_extraction_health,
+)
 from .tokens import (
     all_strings,
     first_bool,
@@ -48,6 +52,8 @@ from .cursors import (
     find_method,
     in_loop,
     in_main_file,
+    literal_count,
+    numeric_literals,
     walk,
 )
 
@@ -77,6 +83,8 @@ __all__ = [
     "_cursor_kind",
     "in_main_file",
     "arg_is_computed",
+    "numeric_literals",
+    "literal_count",
     "find_method",
     "find_loops",
     "in_loop",
@@ -96,6 +104,9 @@ __all__ = [
     "include_resolution_failed",
     "JUCE_SPEC",
     "IPLUG2_SPEC",
+    # extraction-health contract
+    "extraction_health",
+    "stamp_extraction_health",
     # metadata
     "SPI_VERSION",
     "__version__",

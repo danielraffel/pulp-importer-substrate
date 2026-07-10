@@ -27,6 +27,34 @@ Honesty by construction (plan §§7.4/7.5/16.3):
     ParamRange (the {min,max,default,step,skew,symmetric_skew} aggregate), so
     the non-linear curve round-trips through Pulp's normalize/denormalize
     (CLOSE-with-tolerance) instead of being downgraded to LINEAR+PARTIAL.
+
+The `source_curve` IR field (the curve contract) — READ THIS BEFORE TOUCHING
+the emitter. It carries values that are ALREADY IN PULP CONVENTION; each vendor
+extractor converts vendor->Pulp *before* populating the IR, so the emitter here
+stays dumb and never special-cases a vendor:
+
+    source_curve = {
+      "shape":     "linear" | "pow" | "exp",  # provenance: what the SOURCE used
+      "skew":      float | None,   # PULP convention already (norm^(1/skew));
+                                   #   None for shapes with no pow-skew value.
+      "symmetric": bool,
+      "fidelity":  "exact" | "close",  # "close" => keep a PARTIAL diagnostic
+      "centre":    float | None,   # for ParamRange::with_centre() emission
+    }
+
+Why Pulp-convention and not raw vendor values: Pulp's skew explicitly matches
+`juce::NormalisableRange` (denormalize = min + pow(norm, 1/skew)*Δ), so a JUCE
+skew copies through unchanged, but an iPlug2 `ShapePowCurve(n)` exponent is the
+RECIPROCAL — the iPlug extractor stores `skew = 1/n`. That conversion is the
+extractor's job. The emitter only reads Pulp-convention fields:
+  - "shaped" is driven off the shape enum + centre + symmetric, NEVER off a
+    sentinel `skew == None` (an exp curve legitimately has skew=None and must
+    NOT read as unshaped/linear).
+  - shape=="exp" (logarithmic) is not representable in the pow-skew family, so
+    it emits `ParamRange::with_centre(min, max, centre)` + a PARTIAL/CLOSE
+    diagnostic — NEVER a plain linear range.
+  - the "round-trips within float tolerance" comment is emitted only when
+    fidelity=="exact".
   - DSP is scaffolded per the IR classification: pass-through for effects,
     labelled silence for instruments. The real DSP migration is a TODO.
   - Opaque-custom state => an explicit "binary session compatibility is NOT
@@ -41,6 +69,7 @@ into whatever other FORMATS the IR reported so `pulp_add_plugin` lists them.
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 from pathlib import Path, PurePosixPath
@@ -170,6 +199,50 @@ def _zero_literal(sample_type: str) -> str:
 
 # --- parameter emission -----------------------------------------------------
 
+# Construct types whose call site cannot be reduced to a single static
+# parameter — a loop / factory registers an unknown COUNT of params at one call
+# site, so any single `parameters[]` entry extracted at that exact site is a
+# PHANTOM (the S3 double-report bug). `computed_args` is a single-call whose
+# arguments are runtime-computed: that IS a real (if low-confidence) parameter,
+# so it is deliberately NOT treated as claiming/suppressing its own entry.
+_CLAIMING_CONSTRUCT_TYPES = frozenset({"loop_or_factory"})
+
+
+def _construct_claimed_refs(ir: dict) -> set[tuple]:
+    """(file, line) source-refs claimed by a loop/factory construct."""
+    claimed: set[tuple] = set()
+    for c in ir.get("constructs", []) or []:
+        if c.get("construct_type") not in _CLAIMING_CONSTRUCT_TYPES:
+            continue
+        ref = c.get("source_ref") or {}
+        f, ln = ref.get("file"), ref.get("line")
+        if f is not None and ln is not None:
+            claimed.add((f, ln))
+    return claimed
+
+
+def _suppress_construct_claimed_params(ir: dict) -> dict:
+    """Drop any `parameters[]` entry whose source_ref collides with a
+    loop_or_factory construct — such a call is already reported (with unknown
+    cardinality) as a construct, so also emitting it as a high-confidence param
+    is the S3 double-report. Returns a shallow copy with the phantom filtered
+    out (originals are never mutated); a no-op copy when nothing collides.
+    """
+    claimed = _construct_claimed_refs(ir)
+    if not claimed:
+        return ir
+    kept: list[dict] = []
+    for p in ir.get("parameters", []) or []:
+        ref = p.get("source_ref") or {}
+        key = (ref.get("file"), ref.get("line"))
+        if key in claimed:
+            continue  # phantom: the construct already accounts for this call
+        kept.append(p)
+    new = dict(ir)
+    new["parameters"] = kept
+    return new
+
+
 def _param_id_enum(params: list[dict]) -> list[tuple[str, int, str]]:
     """(enum_name, stable_uint32_id, source_id_string) for each resolvable param.
 
@@ -268,9 +341,25 @@ def _emit_param_registration(p: dict, enum_name: str, id_label: str,
     rng = p.get("pulp_range") or {}
     lines: list[str] = []
     curve = p.get("source_curve") or {}
-    skew = curve.get("skew", 1.0)
+    # The curve contract (see module docstring): every field is ALREADY in Pulp
+    # convention — the extractor converted vendor->Pulp. The emitter is dumb.
+    shape = curve.get("shape")
+    skew = curve.get("skew")
     symmetric = bool(curve.get("symmetric", False))
-    shaped = (skew not in (None, 1.0)) or symmetric
+    centre = curve.get("centre")
+    fidelity = curve.get("fidelity", "exact")
+    if shape is None:
+        # Back-compat for pre-contract IRs that only carried `skew` (Pulp conv.).
+        shape = "pow" if (skew is not None and skew != 1.0) else "linear"
+    # "shaped" is driven off the shape enum + centre + symmetric, NOT off a
+    # sentinel skew of None. An exp curve legitimately has skew=None and MUST
+    # still read as shaped (else it silently emits a LINEAR range — the S2 bug).
+    shaped = shape != "linear" or symmetric or centre is not None
+    # An exp/logarithmic curve has no exact pow-skew representation; emit it via
+    # ParamRange::with_centre and keep a PARTIAL/CLOSE diagnostic. Never linear.
+    use_centre = shaped and shape == "exp"
+    if use_centre:
+        fidelity = "close"
     src_id = p.get("source_id_string") or p.get("id")
 
     conf = p.get("confidence")
@@ -305,14 +394,27 @@ def _emit_param_registration(p: dict, enum_name: str, id_label: str,
     lines.append(f"        // source {id_label} id \"{_cpp_str(src_id)}\" "
                  f"(version hint {p.get('source_version_hint')}), "
                  f"confidence {p.get('confidence')}")
-    if shaped:
-        # Pulp's ParamRange now carries the skew/symmetric shape directly, so
-        # the curve round-trips through normalize/denormalize instead of being
-        # downgraded to LINEAR+PARTIAL. The mapping matches the source curve's
-        # behaviour (CLOSE-with-tolerance: float-precision, not bit-exact).
+    if use_centre:
+        # exp / logarithmic: not representable in Pulp's pow-skew family.
+        lines.append("        // source curve shape=exp (logarithmic) is NOT exactly "
+                     "representable in Pulp's")
+        lines.append("        //   pow-skew ParamRange; emitted via "
+                     "ParamRange::with_centre(min, max, centre) —")
+        lines.append("        //   CLOSE/PARTIAL: endpoints and the normalized midpoint "
+                     "match, the interior is")
+        lines.append("        //   an approximation (NOT a faithful round-trip). Verify "
+                     "against the source, or")
+        lines.append("        //   add a true log shape to ParamRange for an EXACT import.")
+    elif shaped:
+        # Pulp's ParamRange carries the skew/symmetric shape directly. Whether it
+        # round-trips depends on the SOURCE fidelity the extractor recorded: only
+        # an EXACT curve may claim the float-tolerance round-trip.
+        note = ("EXACT: round-trips within float tolerance" if fidelity == "exact"
+                else "CLOSE/PARTIAL: approximate — does NOT round-trip exactly; "
+                     "verify against the source")
         lines.append(f"        // source curve skew={skew}"
                      f"{' (symmetric)' if symmetric else ''} emitted as a shaped "
-                     f"ParamRange (CLOSE: round-trips within float tolerance)")
+                     f"ParamRange ({note})")
 
     name = _cpp_str(p.get("name") or src_id)
     unit = ""
@@ -327,7 +429,31 @@ def _emit_param_registration(p: dict, enum_name: str, id_label: str,
     lines.append(f"            .id = {enum_name},")
     lines.append(f'            .name = "{name}",')
     lines.append(f'            .unit = "{unit}",')
-    if shaped:
+    if use_centre:
+        # ParamRange::with_centre(min, max, centre, default, step) derives the
+        # skew that maps the normalized midpoint to `centre`. NEVER a 4-field
+        # linear range for an exp curve.
+        c = centre
+        if c is None:
+            # Contract expects the extractor to supply centre. Derive a
+            # geometric-mean fallback for a strictly-positive range; otherwise
+            # flag loudly and approximate — but still never a silent linear.
+            try:
+                lo, hi = float(rng.get("min")), float(rng.get("max"))
+            except (TypeError, ValueError):
+                lo, hi = 0.0, 1.0
+            if lo > 0.0 and hi > 0.0:
+                c = math.sqrt(lo * hi)
+            else:
+                lines.append("            // TODO(import): exp/log curve centre was not "
+                             "resolved and the range is not")
+                lines.append("            //   strictly positive; with_centre() below "
+                             "approximates it — VERIFY.")
+                c = lo + (hi - lo) * 0.5
+        cl = _cpp_float(c, 0.5)
+        lines.append(f"            .range = pulp::state::ParamRange::with_centre("
+                     f"{mn}, {mx}, {cl}, {df}, {st}),")
+    elif shaped:
         # 6-field aggregate: {min, max, default, step, skew, symmetric_skew}.
         sk = _cpp_float(skew if skew is not None else 1.0, 1.0)
         sym = "true" if symmetric else "false"
@@ -1162,9 +1288,19 @@ def _gen_migration_status(ir: dict, copied_cores: list[str],
     integration_reqs = _integration_requirements(ir)
     todos: list[str] = []
 
-    # Skewed / symmetric params now emit a shaped ParamRange that round-trips
-    # through Pulp's normalize/denormalize (CLOSE-with-tolerance), so they are
-    # no longer migration blockers — nothing is recorded as a TODO for them.
+    # Skewed / symmetric params emit an EXACT shaped ParamRange that round-trips
+    # through Pulp's normalize/denormalize — not a migration blocker. But a curve
+    # the extractor marked CLOSE (fidelity != "exact", e.g. an exp/log curve
+    # emitted via ParamRange::with_centre) is only an APPROXIMATION and MUST stay
+    # a visible verify-me task, never a silent "faithfully imported" claim.
+    for p in ir.get("parameters", []):
+        curve = p.get("source_curve") or {}
+        shape = curve.get("shape")
+        fidelity = curve.get("fidelity", "exact")
+        if shape == "exp" or fidelity == "close":
+            label = p.get("name") or p.get("source_id_string") or p.get("id") or "?"
+            todos.append(f"verify shaped curve for parameter '{label}' — emitted "
+                         f"CLOSE/PARTIAL (approximate; NOT a faithful round-trip)")
     # Unresolved constructs
     for c in ir.get("constructs", []):
         ref = c.get("source_ref", {})
@@ -1274,6 +1410,24 @@ def _gen_report(ir: dict, status: dict, copied_cores: list[str],
                 render_report: Callable[[dict], str]) -> str:
     base = render_report(ir)
     L: list[str] = []
+    # Extraction-health banner (see `extraction_health`): when the extraction is
+    # not trustworthy — a framework header failed to resolve, build_ir errored,
+    # or an explicit framework path yielded zero params with no explaining
+    # construct — say so LOUDLY at the top. A scaffold built on a false-clean
+    # extraction is worse than none; the report must not read as a clean import.
+    health = ir.get("extraction_health") if isinstance(ir, dict) else None
+    failed = bool(ir.get("extraction_failed")) or (
+        isinstance(health, dict) and health.get("ok") is False)
+    if failed:
+        reasons = (health or {}).get("reasons") or []
+        L.append("> ⚠️ **EXTRACTION FAILED — this import is NOT trustworthy.**")
+        L.append(">")
+        L.append("> The extractor could not produce a reliable ProjectIR, so the "
+                 "scaffold below is built on incomplete data. Resolve these before "
+                 "trusting anything in this report:")
+        for r in reasons:
+            L.append(f">   - {r}")
+        L.append(">")
     L.append("> **EMIT verdict:** " + _verdict_line(status))
     L.append(">")
     L.append("> A Pulp migration **scaffold** was generated from this IR. It "
@@ -1503,6 +1657,12 @@ def produce(ir: dict, source_dir: Path | None = None,
         framework_free_predicate = make_framework_free_predicate([])
     if boundary_name_markers is None:
         boundary_name_markers = []
+
+    # A call already reported as a loop/factory construct must NOT also surface
+    # as a high-confidence parameter (the S3 double-report). Filter phantoms up
+    # front so EVERY downstream reader (enum, bind-grid, registration, status)
+    # sees one consistent parameter list.
+    ir = _suppress_construct_claimed_params(ir)
 
     md = ir.get("metadata", {})
     base_name = md.get("name") or ir.get("source", {}).get("project_dir") or "Imported"
