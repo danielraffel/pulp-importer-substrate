@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/danielraffel/pulp"
+Homepage = "https://github.com/Generous-Corp/pulp"
 
 [tool.setuptools]
 packages = ["pulp_importer_substrate", "pulp_importer_substrate.emit"]
